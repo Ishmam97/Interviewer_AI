@@ -16,3 +16,20 @@ class InterviewState(TypedDict):
     rag_context: str
     next_action: str
     is_complete: bool
+
+@dataclass
+class InterviewQuestion:
+    question: str
+    category: str
+    priority: int
+    expected_skills: List[str]
+    follow_up_prompts: List[str] = field(default_factory=list)
+
+@dataclass
+class InterviewNote:
+    question: str
+    response: str
+    timestamp: datetime
+    score: int
+    observations: str
+    relevant_skills: List[str]
