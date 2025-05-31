@@ -59,7 +59,8 @@ class InterviewSystem:
         self.rag_system.create_index(splits)
         
         return self.document_processor.extract_content(documents)
-    
+
+# Create automated interview process for demo - WIP
     def conduct_full_interview(self, resume_path: str, job_desc_path: str) -> InterviewState:
         """Conduct a complete automated interview"""
         print("🚀 Starting Interview Process...")

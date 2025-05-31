@@ -43,27 +43,6 @@ def interactive_interview_mode(interview_system: InterviewSystem, resume_path: s
     print("="*50)
     print(state['interview_report'])
 
-
-def demo_rag_search(interview_system: InterviewSystem):
-    """Demonstrate RAG search functionality"""
-    print("\n" + "="*50)
-    print("RAG SEARCH DEMO")
-    print("="*50)
-    
-    while True:
-        query = input("\nEnter search query (or 'quit' to exit): ")
-        if query.lower() in ['quit', 'exit']:
-            break
-        
-        results = interview_system.search_context(query)
-        
-        print(f"\nFound {len(results)} relevant documents:")
-        for i, (doc, score) in enumerate(results, 1):
-            print(f"\n{i}. Score: {score:.3f}")
-            print(f"Content: {doc.page_content[:200]}...")
-            print(f"Source: {doc.metadata.get('source_type', 'unknown')}")
-
-
 def main():
     """Main application entry point"""
     import os
@@ -105,9 +84,8 @@ def main():
         print("INTERVIEW SYSTEM MAIN MENU")
         print("="*50)
         print("1. Interactive Interview Mode")
-        print("2. RAG Search Demo")
-        print("3. Rebuild FAISS Index")
-        print("4. Exit")
+        print("2. Rebuild FAISS Index")
+        print("3. Exit")
         
         choice = input("\nEnter your choice (1-4): ").strip()
         
@@ -116,15 +94,11 @@ def main():
                 interactive_interview_mode(interview_system, resume_path, job_desc_path)
             
             elif choice == "2":
-                interview_system.setup_rag_system(resume_path, job_desc_path)
-                demo_rag_search(interview_system)
-            
-            elif choice == "3":
                 print("🔧 Rebuilding FAISS index...")
                 interview_system.setup_rag_system(resume_path, job_desc_path, force_rebuild=True)
                 print("✅ Index rebuilt successfully!")
             
-            elif choice == "4":
+            elif choice == "3":
                 print("Goodbye! 👋")
                 break
             
