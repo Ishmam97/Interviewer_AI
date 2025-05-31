@@ -144,12 +144,3 @@ class InterviewSystem:
     def generate_final_report(self, state: InterviewState) -> InterviewState:
         """Generate the final interview report"""
         return self.workflow_manager._generate_report(state)
-    
-    def add_documents_to_index(self, documents):
-        """Add new documents to existing FAISS index"""
-        splits = self.document_processor.split_documents(documents)
-        self.rag_system.add_documents(splits)
-    
-    def search_context(self, query: str, k: int = 5, score_threshold: float = 0.8):
-        """Search for relevant context with optional score filtering"""
-        return self.rag_system.similarity_search_with_score(query, k, score_threshold)

@@ -8,7 +8,7 @@ PLANNING_PROMPT="""
         Job Description:
         {job_description}
         
-        Create questions that:
+        Create {number_of_questions} questions that:
         1. Assess technical skills mentioned in the job requirements
         2. Evaluate experience relevant to the role
         3. Test problem-solving abilities
