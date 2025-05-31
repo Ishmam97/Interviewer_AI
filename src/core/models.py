@@ -1,4 +1,4 @@
-from typing import List, Dict, Any, Optional, TypedDict
+from typing import List, Dict, Any, TypedDict
 from dataclasses import dataclass, field
 from datetime import datetime
 

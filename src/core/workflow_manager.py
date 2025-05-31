@@ -1,5 +1,5 @@
 from langgraph.graph import StateGraph, END
-from models import InterviewState
+from src.core.models import InterviewState
 
 class InterviewWorkflowManager:
     """Manages the LangGraph workflow for interviews"""

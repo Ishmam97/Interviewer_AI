@@ -1,8 +1,8 @@
 import os
 import json
-from typing import Dict, Any, Optional
+from typing import Optional
 from dataclasses import dataclass, asdict
-from models import InterviewConfig
+from src.core.models import InterviewConfig
 
 
 @dataclass
@@ -12,8 +12,8 @@ class SystemConfig:
     interview: InterviewConfig
     
     # File paths
-    default_resume_path: str = "resume.pdf"
-    default_job_desc_path: str = "job_desc.txt"
+    default_resume_path: str = "data/resumes/resume.pdf"
+    default_job_desc_path: str = "data/job_descriptions/job_desc.txt"
     
     # Output directories
     reports_dir: str = "./reports"
@@ -73,7 +73,7 @@ class ConfigManager:
         try:
             # Convert dataclasses to dict for JSON serialization
             config_dict = asdict(self._config)
-            
+            os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
             with open(self.config_path, 'w') as f:
                 json.dump(config_dict, f, indent=2)
             
@@ -104,9 +104,17 @@ class ConfigManager:
     def _get_default_config(self) -> SystemConfig:
         """Get default configuration"""
         return SystemConfig(
-            interview=InterviewConfig(),
-            default_resume_path="resume.pdf",
-            default_job_desc_path="job_desc.txt",
+            interview=InterviewConfig(
+                max_questions=3, # <-- Ensure this matches your desired default
+                chunk_size=800,
+                chunk_overlap=150,
+                rag_k_results=3,
+                temperature=0.3,
+                model_name="gpt-4.1-nano-2025-04-14",
+                index_path="./vector_stores/interview_faiss_index" # Also update this path here
+            ),
+            default_resume_path="data/resumes/resume.pdf",
+            default_job_desc_path="data/job_descriptions/job_desc.txt",
             reports_dir="./reports",
             sessions_dir="./interview_sessions",
             logs_dir="./logs",
