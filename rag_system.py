@@ -55,6 +55,13 @@ class RAGSystem:
         self.save_index()
         print(f"✅ Added {len(documents)} new document chunks to FAISS index")
     
+    def similarity_search(self, query: str, k: int = 3) -> List[Document]:
+        """Search for similar documents"""
+        if not self.vector_store:
+            return []
+        
+        return self.vector_store.similarity_search(query, k=k)
+    
     def get_context(self, query: str, k: int = 3) -> str:
         """Get relevant context as formatted string"""
         relevant_docs = self.similarity_search(query, k=k)
