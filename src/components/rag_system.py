@@ -62,21 +62,6 @@ class RAGSystem:
         
         return self.vector_store.similarity_search(query, k=k)
     
-    def similarity_search_with_score(self, query: str, k: int = 5, score_threshold: float = 0.8) -> List[Tuple[Document, float]]:
-        """Search for similar content with score filtering"""
-        if not self.vector_store:
-            return []
-        
-        results_with_scores = self.vector_store.similarity_search_with_score(query, k=k)
-        
-        # Filter by score threshold (lower scores = more similar)
-        filtered_results = [
-            (doc, score) for doc, score in results_with_scores 
-            if score < score_threshold
-        ]
-        
-        return filtered_results
-    
     def get_context(self, query: str, k: int = 3) -> str:
         """Get relevant context as formatted string"""
         relevant_docs = self.similarity_search(query, k=k)
