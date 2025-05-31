@@ -33,3 +33,14 @@ class InterviewNote:
     score: int
     observations: str
     relevant_skills: List[str]
+
+@dataclass
+class InterviewConfig:
+    """Configuration for interview settings"""
+    max_questions: int = 5
+    chunk_size: int = 500
+    chunk_overlap: int = 50
+    rag_k_results: int = 3
+    temperature: float = 0.3
+    model_name: str = "gpt-4.1-nano-2025-04-14"
+    index_path: str = "./interview_faiss_index"
