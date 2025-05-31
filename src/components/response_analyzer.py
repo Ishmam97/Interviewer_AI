@@ -1,9 +1,9 @@
 from datetime import datetime
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List
 from langchain_openai import ChatOpenAI
 from langchain.prompts import ChatPromptTemplate
 from langchain.schema.output_parser import StrOutputParser
-from prompts import ANALYSIS_PROMPT
+from src.prompts.prompts import ANALYSIS_PROMPT
 
 
 class ResponseAnalyzer:

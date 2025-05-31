@@ -3,7 +3,7 @@ from typing import List, Dict, Any
 from langchain_openai import ChatOpenAI
 from langchain.prompts import ChatPromptTemplate
 from langchain.schema.output_parser import StrOutputParser
-from prompts import PLANNING_PROMPT
+from src.prompts.prompts import PLANNING_PROMPT
 
 
 class InterviewPlanner:

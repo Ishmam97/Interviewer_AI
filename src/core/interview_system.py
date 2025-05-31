@@ -1,13 +1,13 @@
 from typing import Dict, Optional
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 
-from models import InterviewState, InterviewConfig
-from document_processor import DocumentProcessor
-from rag_system import RAGSystem
-from interview_planner import InterviewPlanner
-from response_analyzer import ResponseAnalyzer
-from report_generator import ReportGenerator
-from workflow_manager import InterviewWorkflowManager
+from src.core.models import InterviewState, InterviewConfig
+from src.components.document_processor import DocumentProcessor
+from src.components.rag_system import RAGSystem
+from src.components.interview_planner import InterviewPlanner
+from src.components.response_analyzer import ResponseAnalyzer
+from src.components.report_generator import ReportGenerator
+from src.core.workflow_manager import InterviewWorkflowManager
 
 
 class InterviewSystem:
