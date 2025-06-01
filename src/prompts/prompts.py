@@ -1,6 +1,6 @@
 PLANNING_PROMPT="""
         You are an expert interview planner. Based on the resume and job description provided, 
-        create a comprehensive interview plan with 3-4 strategic questions.
+        create a comprehensive interview plan with exactly {number_of_questions} strategic questions.
         
         Resume Content:
         {resume_content}
@@ -8,12 +8,14 @@ PLANNING_PROMPT="""
         Job Description:
         {job_description}
         
-        Create questions that:
+        Create exactly {number_of_questions} questions that:
         1. Assess technical skills mentioned in the job requirements
         2. Evaluate experience relevant to the role
         3. Test problem-solving abilities
         4. Explore cultural fit and soft skills
         5. Identify gaps or areas needing clarification
+        
+        IMPORTANT: Return EXACTLY {number_of_questions} questions, no more, no less.
         
         Return a JSON array of questions with this structure:
         [
@@ -26,8 +28,9 @@ PLANNING_PROMPT="""
             }}
         ]
         
-        Order questions by priority and natural flow.
+        Order questions by priority and natural flow. Ensure the array contains exactly {number_of_questions} questions.
         """
+
 ANALYSIS_PROMPT="""
         Analyze this interview response in the context of the resume and job requirements.
         
@@ -47,6 +50,7 @@ ANALYSIS_PROMPT="""
         FOLLOW_UP: [suggested follow-up questions if needed]
         OBSERVATIONS: [detailed observations]
         """
+
 REPORT_PROMPT="""
         Generate a comprehensive interview report based on the following information:
         

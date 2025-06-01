@@ -1,5 +1,6 @@
 from src.core.interview_system import InterviewSystem
 from src.core.models import InterviewConfig
+from src.utils.utils import save_interview_session, export_report_to_file, print_interview_summary
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -38,39 +39,31 @@ def interactive_interview_mode(interview_system: InterviewSystem, resume_path: s
     
     # Generate final report
     state = interview_system.generate_final_report(state)
+    
+    # Print summary
+    print_interview_summary(state)
+    
     print("\n" + "="*50)
     print("FINAL INTERVIEW REPORT")
     print("="*50)
     print(state['interview_report'])
-
-
-def demo_rag_search(interview_system: InterviewSystem):
-    """Demonstrate RAG search functionality"""
-    print("\n" + "="*50)
-    print("RAG SEARCH DEMO")
-    print("="*50)
     
-    while True:
-        query = input("\nEnter search query (or 'quit' to exit): ")
-        if query.lower() in ['quit', 'exit']:
-            break
-        
-        results = interview_system.search_context(query)
-        
-        print(f"\nFound {len(results)} relevant documents:")
-        for i, (doc, score) in enumerate(results, 1):
-            print(f"\n{i}. Score: {score:.3f}")
-            print(f"Content: {doc.page_content[:200]}...")
-            print(f"Source: {doc.metadata.get('source_type', 'unknown')}")
-
+    # Save session and report
+    try:
+        session_file = save_interview_session(state)
+        report_file = export_report_to_file(state['interview_report'])
+        print(f"\n✅ Session saved: {session_file}")
+        print(f"✅ Report saved: {report_file}")
+    except Exception as e:
+        print(f"⚠️ Warning: Could not save files: {e}")
 
 def main():
     """Main application entry point"""
     import os
     
-    # Configuration
+    # Configuration - now properly using max_questions
     config = InterviewConfig(
-        max_questions=2,
+        max_questions=3,  # This will now be used by the planner
         chunk_size=500,
         chunk_overlap=50,
         rag_k_results=3,
@@ -105,31 +98,26 @@ def main():
         print("INTERVIEW SYSTEM MAIN MENU")
         print("="*50)
         print("1. Interactive Interview Mode")
-        print("2. RAG Search Demo")
-        print("3. Rebuild FAISS Index")
-        print("4. Exit")
+        print("2. Rebuild FAISS Index")
+        print("3. Exit")
         
-        choice = input("\nEnter your choice (1-4): ").strip()
+        choice = input("\nEnter your choice (1-3): ").strip()
         
         try:
             if choice == "1":
                 interactive_interview_mode(interview_system, resume_path, job_desc_path)
             
             elif choice == "2":
-                interview_system.setup_rag_system(resume_path, job_desc_path)
-                demo_rag_search(interview_system)
-            
-            elif choice == "3":
                 print("🔧 Rebuilding FAISS index...")
                 interview_system.setup_rag_system(resume_path, job_desc_path, force_rebuild=True)
                 print("✅ Index rebuilt successfully!")
             
-            elif choice == "4":
+            elif choice == "3":
                 print("Goodbye! 👋")
                 break
             
             else:
-                print("❌ Invalid choice. Please enter 1-4.")
+                print("❌ Invalid choice. Please enter 1-3.")
         except KeyboardInterrupt:
             print("\n\nOperation interrupted by user.")
             continue
