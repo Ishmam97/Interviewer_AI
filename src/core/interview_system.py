@@ -36,7 +36,8 @@ class InterviewSystem:
             index_path=self.config.index_path
         )
         
-        self.planner = InterviewPlanner(self.llm)
+        # Pass config to planner so it can use max_questions
+        self.planner = InterviewPlanner(self.llm, config=self.config)
         self.analyzer = ResponseAnalyzer(self.llm)
         self.report_generator = ReportGenerator(self.llm)
         
@@ -59,7 +60,8 @@ class InterviewSystem:
         self.rag_system.create_index(splits)
         
         return self.document_processor.extract_content(documents)
-    
+
+    # Create automated interview process for demo - WIP
     def conduct_full_interview(self, resume_path: str, job_desc_path: str) -> InterviewState:
         """Conduct a complete automated interview"""
         print("🚀 Starting Interview Process...")
@@ -143,12 +145,3 @@ class InterviewSystem:
     def generate_final_report(self, state: InterviewState) -> InterviewState:
         """Generate the final interview report"""
         return self.workflow_manager._generate_report(state)
-    
-    def add_documents_to_index(self, documents):
-        """Add new documents to existing FAISS index"""
-        splits = self.document_processor.split_documents(documents)
-        self.rag_system.add_documents(splits)
-    
-    def search_context(self, query: str, k: int = 5, score_threshold: float = 0.8):
-        """Search for relevant context with optional score filtering"""
-        return self.rag_system.similarity_search_with_score(query, k, score_threshold)
