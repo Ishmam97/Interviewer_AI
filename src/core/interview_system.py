@@ -36,7 +36,8 @@ class InterviewSystem:
             index_path=self.config.index_path
         )
         
-        self.planner = InterviewPlanner(self.llm)
+        # Pass config to planner so it can use max_questions
+        self.planner = InterviewPlanner(self.llm, config=self.config)
         self.analyzer = ResponseAnalyzer(self.llm)
         self.report_generator = ReportGenerator(self.llm)
         
@@ -60,7 +61,7 @@ class InterviewSystem:
         
         return self.document_processor.extract_content(documents)
 
-# Create automated interview process for demo - WIP
+    # Create automated interview process for demo - WIP
     def conduct_full_interview(self, resume_path: str, job_desc_path: str) -> InterviewState:
         """Conduct a complete automated interview"""
         print("🚀 Starting Interview Process...")
