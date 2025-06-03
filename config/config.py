@@ -105,13 +105,13 @@ class ConfigManager:
         """Get default configuration"""
         return SystemConfig(
             interview=InterviewConfig(
-                max_questions=3, # <-- Ensure this matches your desired default
+                max_questions=3,
                 chunk_size=800,
                 chunk_overlap=150,
                 rag_k_results=3,
                 temperature=0.3,
                 model_name="gpt-4.1-nano-2025-04-14",
-                index_path="./vector_stores/interview_faiss_index" # Also update this path here
+                index_path="./vector_stores/interview_faiss_index"
             ),
             default_resume_path="data/resumes/resume.pdf",
             default_job_desc_path="data/job_descriptions/job_desc.txt",
