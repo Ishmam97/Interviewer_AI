@@ -26,10 +26,20 @@ st.set_page_config(
 st.markdown("""
 <style>
     .main-header { background: linear-gradient(90deg, #667eea 0%, #764ba2 100%); padding: 2rem; border-radius: 10px; margin-bottom: 2rem; color: white; text-align: center; }
-    [data-testid="stForm"]{ background: linear-gradient(90deg, #667eea 0%, #764ba2 100%); padding: 2rem; border-radius: 10px; border: 1px solid #e9ecef; margin: 2rem auto; max-width: 700px; }
+    [data-testid="stForm"] {
+        background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+        padding: 2rem;
+        border-radius: 10px;
+        border: 1px solid #e9ecef;
+        margin: 2rem auto;
+        width: 100%;
+    }
     .interview-card { background: #f8f9fa; padding: 1.5rem; border-radius: 8px; border-left: 4px solid #667eea; margin: 1rem 0; color: black; }
     .question-box { background: #e3f2fd; padding: 1rem; border-radius: 8px; border-left: 4px solid #2196f3; margin: 1rem 0; color: black; }
     .response-box { background: #f3e5f5; padding: 1rem; border-radius: 8px; border-left: 4px solid #9c27b0; margin: 1rem 0; color: black; }
+    [data-testid="stForm"] textarea {
+    font-size: 1.1em;
+    }
     .score-display { background: #e8f5e8; padding: 0.5rem 1rem; border-radius: 20px; display: inline-block; font-weight: bold; color: #2e7d32; }
     .user-info { background: linear-gradient(90deg, #667eea 0%, #764ba2 100%); padding: 1rem; border-radius: 8px; margin-bottom: 1rem; }
     .stButton > button { width: 100%; background: linear-gradient(90deg, #667eea 0%, #764ba2 100%); color: white; border: none; border-radius: 8px; padding: 0.5rem 1rem; font-weight: bold; }
@@ -371,21 +381,30 @@ def display_interview_progress(): #
                     avg_score = sum(scores) / len(scores) #
                     st.markdown(f'<div class="score-display">Average Score: {avg_score:.1f}/10</div>', unsafe_allow_html=True) #
 
-def display_conversation_history(): #
-    if st.session_state.conversation_history and isinstance(st.session_state.conversation_history, list): #
-        st.subheader("📝 Interview Conversation") #
+def display_conversation_history():
+    if st.session_state.conversation_history and isinstance(st.session_state.conversation_history, list):
+        st.subheader("📝 Interview Conversation")
         
-        for i, exchange in enumerate(st.session_state.conversation_history): #
-            if isinstance(exchange, dict): 
-                with st.container(): #
-                    st.markdown(f"""<div class="question-box"><strong>🤖 Interviewer:</strong><br>{exchange.get('question', 'N/A')}</div>""", unsafe_allow_html=True) #
-                    st.markdown(f"""<div class="response-box"><strong>👤 You:</strong><br>{exchange.get('response', 'N/A')}</div>""", unsafe_allow_html=True) #
-                    if 'score' in exchange: #
-                        st.markdown(f'<div class="score-display">Score: {exchange.get("score", 0)}/10</div>', unsafe_allow_html=True) #
-                    st.markdown("---") #
+        for i, exchange in enumerate(st.session_state.conversation_history):
+            if isinstance(exchange, dict):
+                with st.container():
+                    st.markdown(f"""
+                    <div class="question-box">
+                        <strong>🤖 Interviewer:</strong>
+                        <p style="font-size: 1.1em; margin-bottom: 0;">{exchange.get('question', 'N/A')}</p>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    st.markdown(f"""
+                    <div class="response-box">
+                        <strong>👤 You:</strong>
+                        <p style="font-size: 1.1em; margin-bottom: 0;">{exchange.get('response', 'N/A')}</p>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    if 'score' in exchange:
+                        st.markdown(f'<div class="score-display">Score: {exchange.get("score", 0)}/10</div>', unsafe_allow_html=True)
+                    st.markdown("---")
             else:
-                st.warning(f"Skipping malformed conversation entry: {exchange}") #
-
+                st.warning(f"Skipping malformed conversation entry: {exchange}")
 
 def main():
     initialize_session_state()
@@ -533,82 +552,117 @@ def main():
                         save_session_to_supabase() #
                         st.rerun() #
 
-            if st.session_state.get('interview_complete'): #
-                st.balloons() #
-                st.markdown("""<div class="main-header"><h2>🎉 Interview Completed!</h2><p>Great job! Here is your comprehensive report.</p></div>""", unsafe_allow_html=True) #
+            if st.session_state.get('interview_complete'):
+                st.balloons()
+                st.markdown("""<div class="main-header"><h2>🎉 Interview Completed!</h2><p>Great job! Here are your results and feedback.</p></div>""", unsafe_allow_html=True)
 
-                current_interview_state = st.session_state.get('interview_state', {}) #
+                current_interview_state = st.session_state.get('interview_state', {})
                 report_generated_this_run = False
 
-                # Generate and save report if not already done or if last_generated_report_id is not set for this completion
+                # Generate and save report if not already done or if last_generated_report_id is not set
                 if isinstance(current_interview_state, dict) and not st.session_state.get('last_generated_report_id'):
-                    with st.spinner("📊 Generating and saving your comprehensive interview report..."): #
-                        final_state = st.session_state.interview_system.generate_final_report(current_interview_state) #
-                        st.session_state.interview_state = final_state #
+                    with st.spinner("📊 Generating and saving your comprehensive interview report..."):
+                        final_state = st.session_state.interview_system.generate_final_report(current_interview_state)
+                        st.session_state.interview_state = final_state
                         
                         save_session_to_supabase()  # Save updated session state with report string
 
-                        if st.session_state.user and hasattr(st.session_state.user, 'id'): #
-                            report_content_str = final_state.get('interview_report', '') #
-                            if report_content_str: 
+                        if st.session_state.user and hasattr(st.session_state.user, 'id'):
+                            report_content_str = final_state.get('interview_report', '')
+                            if report_content_str:
                                 report_title = f"Interview Report for {user_email} on {datetime.now().strftime('%Y-%m-%d')}"
                                 if st.session_state.current_session_id:
                                     report_title = f"Report for Session ({str(st.session_state.current_session_id)[:8]}) - {datetime.now().strftime('%Y-%m-%d')}"
                                 
-                                report_data_for_db = { #
+                                report_data_for_db = {
                                     'title': report_title,
-                                    'report_content': report_content_str, #
-                                    'summary': final_state.get('report_summary_json', {}), 
-                                    'scores': final_state.get('report_scores_json', {}), 
-                                    'recommendations': final_state.get('report_recommendations_text', '') 
+                                    'report_content': report_content_str,
+                                    'summary': final_state.get('report_summary_json', {}),
+                                    'scores': final_state.get('report_scores_json', {}),
+                                    'recommendations': final_state.get('report_recommendations_text', '')
                                 }
-                                saved_report_id = st.session_state.supabase_manager.save_interview_report( #
-                                    user_id=st.session_state.user.id, #
-                                    session_id=st.session_state.current_session_id, 
-                                    report_data=report_data_for_db #
+                                saved_report_id = st.session_state.supabase_manager.save_interview_report(
+                                    user_id=st.session_state.user.id,
+                                    session_id=st.session_state.current_session_id,
+                                    report_data=report_data_for_db
                                 )
-                                if saved_report_id: #
-                                    st.session_state.last_generated_report_id = saved_report_id # Store the new report ID
+                                if saved_report_id:
+                                    st.session_state.last_generated_report_id = saved_report_id
                                     report_generated_this_run = True
-                                    st.toast(f"📝 Report saved (ID: {saved_report_id[:8]})!", icon="📄") #
+                                    st.toast(f"📝 Report saved (ID: {saved_report_id[:8]})!", icon="📄")
                                 else:
-                                    st.error("Failed to save the detailed interview report to the database.") #
+                                    st.error("Failed to save the detailed interview report to the database.")
                             else:
-                                st.warning("Report content was empty, not saving to dedicated reports table.") #
+                                st.warning("Report content was empty, not saving to dedicated reports table.")
                         else:
-                            st.warning("User information not found. Cannot save report.") #
-                
-                # Fetch and display the report
-                report_to_display_id = st.session_state.get('last_generated_report_id')
-                if report_to_display_id:
-                    with st.spinner("Loading your report..."):
-                        report_details_data = st.session_state.supabase_manager.get_report(report_to_display_id)
-                    
-                    if report_details_data:
-                        with st.container(): # New container for the direct report display
-                             st.markdown("### Your Generated Interview Report") # Removed anchor=False
-                             display_report_details_component(report_details_data)
+                            st.warning("User information not found. Cannot save report.")
+
+                # Display results in tabs
+                result_tab1, result_tab2, result_tab3 = st.tabs(["📊 Summary", "💬 Conversation", "📋 Full Report"])
+
+                with result_tab1:
+                    if st.session_state.interview_state and 'interview_notes' in st.session_state.interview_state:
+                        notes = st.session_state.interview_state['interview_notes']
+                        if notes:
+                            scores = [note.get('score', 0) for note in notes if isinstance(note, dict) and 'score' in note]
+                            total_questions = len(notes)
+                            if total_questions > 0:
+                                avg_score = sum(scores) / total_questions
+                                max_score = max(scores) if scores else 0
+                                min_score = min(scores) if scores else 0
+
+                                col1, col2, col3, col4 = st.columns(4)
+                                with col1:
+                                    st.metric("Total Questions", total_questions)
+                                with col2:
+                                    st.metric("Average Score", f"{avg_score:.1f}/10")
+                                with col3:
+                                    st.metric("Highest Score", f"{max_score}/10")
+                                with col4:
+                                    st.metric("Lowest Score", f"{min_score}/10")
+
+                                st.subheader("📈 Score Distribution")
+                                score_data = {f"Question {i+1}": score for i, score in enumerate(scores)}
+                                st.bar_chart(score_data)
+                            else:
+                                st.info("No questions answered yet.")
+                        else:
+                            st.info("No interview notes available.")
                     else:
-                        st.error("Could not retrieve the generated report for display.")
-                elif not report_generated_this_run : # If report wasn't generated now (e.g. page reload after completion)
-                     st.info("Report already generated. You can find it in the dashboard or start a new interview.")
+                        st.info("No interview data available.")
 
+                with result_tab2:
+                    display_conversation_history()
 
-                # New Interview button 
+                with result_tab3:
+                    report_to_display_id = st.session_state.get('last_generated_report_id')
+                    if report_to_display_id:
+                        with st.spinner("Loading your report..."):
+                            report_details_data = st.session_state.supabase_manager.get_report(report_to_display_id)
+                        if report_details_data:
+                            st.markdown("### Your Generated Interview Report")
+                            display_report_details_component(report_details_data)
+                        else:
+                            st.error("Could not retrieve the generated report for display.")
+                    elif not report_generated_this_run:
+                        st.info("Report already generated. You can find it in the dashboard or start a new interview.")
+
+                # New Interview button
                 st.markdown("---")
                 _, btn_col, _ = st.columns([1,2,1])
                 with btn_col:
                     if st.button("🔄 Start New Interview", key="start_new_interview_button_main", use_container_width=True):
-                        keys_to_reset = [ 
-                            'interview_state', 'interview_started', 'current_question', 
-                            'conversation_history', 'interview_complete', 'current_session_id', 
-                            'files_uploaded', 'resume_upload', 'job_desc_upload', 
+                        keys_to_reset = [
+                            'interview_state', 'interview_started', 'current_question',
+                            'conversation_history', 'interview_complete', 'current_session_id',
+                            'files_uploaded', 'resume_upload', 'job_desc_upload',
                             'selected_report_id_to_display', 'files_uploaded_message_shown',
-                            'last_generated_report_id' # Reset this too
+                            'last_generated_report_id'
                         ]
-                        for key in keys_to_reset: 
-                            if key in st.session_state: del st.session_state[key]
-                        st.session_state.files_uploaded = False 
+                        for key in keys_to_reset:
+                            if key in st.session_state:
+                                del st.session_state[key]
+                        st.session_state.files_uploaded = False
                         st.rerun()
 
     with tab2:
