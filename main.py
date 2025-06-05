@@ -63,7 +63,7 @@ def main():
     
     # Configuration - now properly using max_questions
     config = InterviewConfig(
-        max_questions=3,  # This will now be used by the planner
+        max_questions=5,  # This will now be used by the planner
         chunk_size=500,
         chunk_overlap=50,
         rag_k_results=3,
@@ -73,7 +73,7 @@ def main():
     )
     
     # Initialize the interview system
-    api_key = os.getenv("OPENAI_API_KEY", "")
+    api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         print("❌ Please set OPENAI_API_KEY environment variable")
         return
