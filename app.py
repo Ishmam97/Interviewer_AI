@@ -11,7 +11,9 @@ from src.database.supabase import SupabaseManager
 from dotenv import load_dotenv
 import markdown
 import json
-
+from gtts import gTTS
+import base64
+import io
 load_dotenv()
 
 # Page configuration (remains the same)
@@ -50,6 +52,20 @@ st.markdown("""
     .completion-report-display { margin-top: 1.5rem; padding: 1.5rem; background-color: #f9f9f9; border-radius: 8px; }
 </style>
 """, unsafe_allow_html=True)
+
+def generate_question_audio(question: str) -> str:
+    try:
+        tts = gTTS(text=question, lang='en')
+        audio_fp = io.BytesIO()
+        tts.write_to_fp(audio_fp)
+        audio_fp.seek(0)
+        audio_bytes = audio_fp.read()
+        audio_base64 = base64.b64encode(audio_bytes).decode()
+        audio_html = f'<audio autoplay><source src="data:audio/mp3;base64,{audio_base64}" type="audio/mpeg"></audio>'
+        return audio_html
+    except Exception as e:
+        st.warning(f"Could not generate audio: {e}")
+        return ""
 
 # --- Helper function to display a report (used on completion and dashboard) ---
 def display_report_details_component(report_details: Dict[str, Any]):
@@ -519,8 +535,15 @@ def main():
                 if st.session_state.interview_state: #
                     question = st.session_state.interview_system.get_next_question(st.session_state.interview_state) #
                     if question: #
-                        st.session_state.current_question = question #
-                        st.markdown(f"""<div class="question-box"><h4>🤖 Interviewer Question:</h4><p style="font-size: 1.1em; margin-bottom: 0;">{question}</p></div>""", unsafe_allow_html=True) #
+                        st.session_state.current_question = question
+                        audio_html = generate_question_audio(question)
+                        st.markdown(f"""
+                            <div class="question-box">
+                                <h4>🤖 Interviewer Question:</h4>
+                                <p style="font-size: 1.1em; margin-bottom: 0;">{question}</p>
+                            </div>
+                            {audio_html}
+                        """, unsafe_allow_html=True)
                         with st.form(key="response_form", clear_on_submit=True): #
                             candidate_response = st.text_area("Your Answer:", height=150, placeholder="Type your response here...", key="candidate_input") #
                             form_col1, _, form_col3 = st.columns([1,1,1]) #

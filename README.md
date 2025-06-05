@@ -3,6 +3,8 @@
 ## Overview
 The AI Interview Assistant is a web-based application designed to conduct AI-driven mock interviews. It leverages large language models (LLMs), LangGraph for workflow management, Streamlit for the user interface, LangChain for AI integrations, and Supabase for database operations. The application allows users to upload resumes and job descriptions, participate in interactive interviews, receive real-time feedback, and generate detailed performance reports. It supports user authentication, session management, and personalized interview experiences.
 
+**Try the live demo here** : https://interviewerai-ishmamdemo.streamlit.app/
+
 ## Features
 - **User Authentication**: Secure sign-up and sign-in functionality using Supabase Auth.
 - **Document Upload**: Upload resumes (PDF/TXT) and job descriptions (TXT) to tailor interviews.
