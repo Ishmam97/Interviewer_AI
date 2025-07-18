@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, Form
+from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
@@ -69,6 +69,34 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Add request logging middleware
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    print(f"[MIDDLEWARE] {request.method} {request.url}")
+    print(f"[MIDDLEWARE] Headers: {dict(request.headers)}")
+    
+    # Check specifically for Authorization header
+    auth_header = request.headers.get("authorization")
+    if auth_header:
+        print(f"[MIDDLEWARE] Authorization header present: {auth_header[:20]}...")
+    else:
+        print(f"[MIDDLEWARE] No authorization header found")
+    
+    response = await call_next(request)
+    print(f"[MIDDLEWARE] Response status: {response.status_code}")
+    return response
+
+# Initialize services
+openai_api_key = os.getenv("OPENAI_API_KEY")
+if not openai_api_key:
+    raise ValueError("OPENAI_API_KEY environment variable is required")
+
+interview_system = InterviewSystem(openai_api_key)
+supabase_manager = SupabaseManager()
+security = HTTPBearer(auto_error=False)
+
+print("[STARTUP] Server initialized with security and middleware")
+
 # Security
 security = HTTPBearer()
 
@@ -78,14 +106,32 @@ active_sessions: Dict[str, Dict[str, Any]] = {}
 
 def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     """Get current user from JWT token"""
-    # For now, we'll skip JWT validation and use a simple approach
-    # In production, implement proper JWT validation
+    print(f"DEBUG: get_current_user called")
+    print(f"DEBUG: credentials received: {credentials}")
+    print(f"DEBUG: credentials.credentials: {credentials.credentials}")
+    print(f"DEBUG: settings.ENVIRONMENT: {settings.ENVIRONMENT}")
+    
+    # For development: Accept dummy token and return mock user
+    if settings.ENVIRONMENT == "development" and credentials.credentials == "dummy-token":
+        print("DEBUG: Using development dummy token authentication")
+        # Return a mock user object for development
+        return type('User', (), {
+            'id': '176d665a-4932-4934-a03d-5519301517f5',
+            'email': 'iasolaiman@ualr.edu',
+            'name': 'iasolaiman'
+        })()
+    
+    print("DEBUG: Attempting Supabase authentication")
+    # For production, implement proper JWT validation
     try:
         user = supabase_manager.get_current_user()
+        print(f"DEBUG: Supabase user: {user}")
         if not user:
+            print("DEBUG: No user found, raising 401")
             raise HTTPException(status_code=401, detail="Authentication required")
         return user
     except Exception as e:
+        print(f"DEBUG: Authentication failed with error: {e}")
         raise HTTPException(status_code=401, detail=f"Authentication failed: {e}")
 
 def create_interview_system(config: InterviewConfigAPI = None) -> InterviewSystem:
@@ -229,9 +275,18 @@ async def signup(credentials: UserCredentials):
         if result.get("success"):
             return {"message": "User created successfully", "user": result.get("user")}
         else:
-            raise HTTPException(status_code=400, detail=result.get("error", "Signup failed"))
+            error_message = result.get("error", "Signup failed")
+            # Return appropriate status codes based on error type
+            if "Password should contain" in error_message:
+                raise HTTPException(status_code=422, detail=error_message)
+            elif "already registered" in error_message.lower():
+                raise HTTPException(status_code=409, detail=error_message)
+            else:
+                raise HTTPException(status_code=400, detail=error_message)
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.post("/auth/signin")
 async def signin(credentials: UserCredentials):
@@ -257,12 +312,20 @@ async def signout(current_user=Depends(get_current_user)):
 # Interview endpoints
 @app.post("/interview/start", response_model=InterviewResponse)
 async def start_interview(
-    request: StartInterviewRequest,
     resume: UploadFile = File(...),
     job_description: UploadFile = File(...),
+    max_questions: int = Form(3),
+    model_name: str = Form("gpt-4o-mini"),
+    temperature: float = Form(0.3),
     current_user=Depends(get_current_user)
 ):
     """Start a new interview session"""
+    print(f"DEBUG: start_interview endpoint called")
+    print(f"DEBUG: current_user: {current_user}")
+    print(f"DEBUG: max_questions: {max_questions}, model_name: {model_name}, temperature: {temperature}")
+    print(f"DEBUG: resume file: {resume.filename}, content_type: {resume.content_type}, size: {resume.size}")
+    print(f"DEBUG: job_description file: {job_description.filename}, content_type: {job_description.content_type}, size: {job_description.size}")
+    
     try:
         # Save uploaded files temporarily
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf" if resume.filename.endswith('.pdf') else ".txt") as resume_file:
@@ -276,7 +339,11 @@ async def start_interview(
             job_path = job_file.name
 
         # Create interview system
-        config = request.config or InterviewConfigAPI()
+        config = InterviewConfigAPI(
+            max_questions=max_questions,
+            model_name=model_name,
+            temperature=temperature
+        )
         interview_system = create_interview_system(config)
         
         # Start interview

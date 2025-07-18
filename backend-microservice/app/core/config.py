@@ -30,6 +30,8 @@ class Settings(BaseSettings):
         "http://localhost:3000",
         "http://localhost:8501",
         "http://localhost:8000",
+        "http://localhost:8080",  # Frontend Vite dev server (alternative port)
+        "http://localhost:8081",  # Frontend Vite dev server
         "https://your-frontend-domain.com"
     ]
     
