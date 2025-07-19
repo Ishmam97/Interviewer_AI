@@ -1,0 +1,32 @@
+version: '3.8'
+services:
+  backend:
+    build:
+      context: ./backend-microservice
+    container_name: backend
+    env_file:
+      - ./backend-microservice/.env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend-microservice:/app
+      - ./interview_sessions:/app/interview_sessions
+      - ./reports:/app/reports
+      - ./vector_stores:/app/vector_stores
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    container_name: frontend
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    working_dir: /app
+    command: npm run dev -- --host
+    environment:
+      - CHOKIDAR_USEPOLLING=true
+    restart: unless-stopped
