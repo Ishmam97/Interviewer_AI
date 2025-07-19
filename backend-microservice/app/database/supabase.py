@@ -167,6 +167,9 @@ class SupabaseManager:
     
     def create_interview_session(self, user_id: str, session_data: Dict[str, Any]) -> Optional[str]:
         """Create a new interview session with improved error handling"""
+        logger.info(f"🔄 Creating interview session for user: {user_id}")
+        logger.info(f"📋 Input session_data keys: {list(session_data.keys())}")
+        
         try:
             # Prepare session data with required fields
             safe_session_data = {
@@ -185,24 +188,49 @@ class SupabaseManager:
                 'created_at': datetime.now().isoformat()
             }
             
+            logger.info(f"💾 Sending to DB - user_id: {safe_session_data['user_id']}, title: {safe_session_data['title']}")
+            logger.info(f"💾 Sending to DB - status: {safe_session_data['status']}, total_questions: {safe_session_data['total_questions']}")
+            
             response = self.client.table('interview_sessions').insert(safe_session_data).execute()
-            return response.data[0]['id'] if response.data else None
+            
+            if response.data:
+                session_id = response.data[0]['id']
+                logger.info(f"✅ Session created successfully with ID: {session_id}")
+                return session_id
+            else:
+                logger.error("❌ No data returned from session insert")
+                if hasattr(response, 'error') and response.error:
+                    logger.error(f"❌ Supabase error: {response.error}")
+                return None
+                
         except Exception as e:
-            logger.error(f"Error creating interview session: {e}")
+            logger.error(f"❌ Error creating interview session: {e}")
+            logger.error(f"❌ Exception type: {type(e).__name__}")
+            import traceback
+            logger.error(f"❌ Full traceback: {traceback.format_exc()}")
+            
             # Try with minimal data if full insert fails
             try:
+                logger.info("🔄 Attempting minimal session save...")
                 minimal_data = {
                     'user_id': user_id,
-                    'status': 'in_progress',
+                    'status': 'in_progress',  # Use consistent status value
                     'created_at': datetime.now().isoformat()
                 }
                 response = self.client.table('interview_sessions').insert(minimal_data).execute()
-                return response.data[0]['id'] if response.data else None
-            except:
+                if response.data:
+                    session_id = response.data[0]['id']
+                    logger.info(f"✅ Minimal session created with ID: {session_id}")
+                    return session_id
+                else:
+                    logger.error("❌ Minimal session save also failed")
+                    return None
+            except Exception as minimal_error:
+                logger.error(f"❌ Minimal session save failed: {minimal_error}")
                 return None
     
-    def update_interview_session(self, session_id: str, session_data: Dict[str, Any]) -> bool:
-        """Update an existing interview session"""
+    def update_interview_session(self, session_id: str, session_data: Dict[str, Any], user_id: str = None) -> bool:
+        """Update an existing interview session with retry and fallback"""
         try:
             # Prepare safe update data
             safe_session_data = {
@@ -228,10 +256,63 @@ class SupabaseManager:
                 if key in session_data:
                     safe_session_data[db_field] = session_data[key]
             
+            logger.info(f"🔄 Attempting to update session {session_id} with data: {safe_session_data}")
             response = self.client.table('interview_sessions').update(safe_session_data).eq('id', session_id).execute()
-            return len(response.data) > 0
+            
+            if len(response.data) > 0:
+                logger.info(f"✅ Session {session_id} updated successfully.")
+                return True
+            else:
+                logger.warning(f"⚠️ Session update failed for ID {session_id}. No rows affected.")
+                
+                # Check if session exists
+                session_exists = self.get_interview_session(session_id)
+                if not session_exists:
+                    logger.warning(f"⚠️ Session {session_id} not found. Attempting to recreate...")
+                    
+                    # Extract user_id from session_data or parameter
+                    fallback_user_id = user_id or session_data.get('user_id')
+                    if not fallback_user_id:
+                        logger.error(f"❌ Cannot recreate session {session_id} - no user_id provided")
+                        return False
+                    
+                    # Recreate session with required fields
+                    minimal_session_data = {
+                        "id": session_id,
+                        "user_id": fallback_user_id,
+                        "status": session_data.get('status', 'in_progress'),
+                        "title": session_data.get('title', f"Recovered Session {datetime.now().strftime('%Y-%m-%d %H:%M')}"),
+                        "total_questions": session_data.get('total_questions', 0),
+                        "current_question_idx": session_data.get('current_question_idx', 0),
+                        "interview_plan": session_data.get('interview_plan', []),
+                        "interview_notes": session_data.get('interview_notes', []),
+                        "conversation_history": session_data.get('conversation_history', []),
+                        "resume_content": session_data.get('resume_content', ''),
+                        "job_description": session_data.get('job_description', ''),
+                        "final_report": session_data.get('final_report', ''),
+                        "average_score": session_data.get('average_score'),
+                        "created_at": datetime.now().isoformat(),
+                        "updated_at": datetime.now().isoformat()
+                    }
+                    
+                    try:
+                        create_response = self.client.table('interview_sessions').insert(minimal_session_data).execute()
+                        
+                        if create_response.data:
+                            logger.info(f"✅ Session {session_id} recreated successfully with user_id {fallback_user_id}.")
+                            return True
+                        else:
+                            logger.error(f"❌ Failed to recreate session {session_id} - no data returned.")
+                            return False
+                    except Exception as create_error:
+                        logger.error(f"❌ Exception during session recreation: {create_error}")
+                        return False
+                return False
         except Exception as e:
-            logger.error(f"Error updating interview session: {e}")
+            logger.error(f"❌ Error updating interview session: {e}")
+            logger.error(f"❌ Exception type: {type(e).__name__}")
+            import traceback
+            logger.error(f"❌ Full traceback: {traceback.format_exc()}")
             return False
     
     def get_interview_session(self, session_id: str) -> Optional[Dict[str, Any]]:
@@ -245,6 +326,8 @@ class SupabaseManager:
     
     def get_user_interview_sessions(self, user_id: str, limit: int = 50) -> List[Dict[str, Any]]:
         """Get all interview sessions for a user"""
+        logger.info(f"🔍 Fetching interview sessions for user: {user_id}, limit: {limit}")
+        
         try:
             response = (self.client.table('interview_sessions')
                        .select('*')
@@ -252,9 +335,32 @@ class SupabaseManager:
                        .order('created_at', desc=True)
                        .limit(limit)
                        .execute())
-            return response.data
+            
+            sessions = response.data if response.data else []
+            logger.info(f"📊 Found {len(sessions)} sessions for user {user_id}")
+            
+            if sessions:
+                # Log first session details for debugging
+                first_session = sessions[0]
+                logger.info(f"📋 First session sample - ID: {first_session.get('id')}, title: {first_session.get('title')}, status: {first_session.get('status')}")
+            else:
+                logger.info("📋 No sessions found - checking if user exists in any sessions...")
+                # Debug query to see if user has any sessions at all
+                all_sessions_response = (self.client.table('interview_sessions')
+                                       .select('user_id, id, title')
+                                       .limit(5)
+                                       .execute())
+                if all_sessions_response.data:
+                    logger.info(f"📋 Sample of all sessions in DB: {all_sessions_response.data}")
+                else:
+                    logger.info("📋 No sessions found in entire table")
+            
+            return sessions
         except Exception as e:
-            logger.error(f"Error fetching user interview sessions: {e}")
+            logger.error(f"❌ Error fetching user interview sessions: {e}")
+            logger.error(f"❌ Exception type: {type(e).__name__}")
+            import traceback
+            logger.error(f"❌ Full traceback: {traceback.format_exc()}")
             return []
     
     def delete_interview_session(self, session_id: str) -> bool:
@@ -268,44 +374,63 @@ class SupabaseManager:
     
     def save_interview_report(self, user_id: str, session_id: Optional[str], report_data: Dict[str, Any]) -> Optional[str]:
         """Save an interview report"""
+        logger.info(f"🔄 Saving interview report for user: {user_id}, session: {session_id}")
+        logger.info(f"📋 Input report_data keys: {list(report_data.keys())}")
+
         try:
+            # Validate session_id exists in interview_sessions
+            if session_id:
+                session_exists = self.get_interview_session(session_id)
+                if not session_exists:
+                    logger.error(f"❌ Session ID {session_id} does not exist in interview_sessions. Aborting report save.")
+                    return None
+
             # Ensure report_content is provided as it's NOT NULL in the schema
             report_content = report_data.get('report_content', '')
             if not report_content:
-                logger.error("Attempted to save report with empty content.")
-                # Depending on desired behavior, you might return None or raise an error.
-                # For now, this log will highlight the issue, Supabase will raise error on insert if empty.
-                # Consider adding explicit error return: return None (and app.py should check for it)
+                logger.error("❌ Attempted to save report with empty content.")
+                return None
 
             safe_report_data = {
                 'user_id': user_id,
-                'session_id': session_id, # This will be None if session_id is None
+                'session_id': session_id,  # This will be None if session_id is None
                 'title': report_data.get('title', f"Interview Report {datetime.now().strftime('%Y-%m-%d %H:%M')}"),
-                'report_content': report_content, # report_content must be non-empty
-                'summary': report_data.get('summary', {}), # Default to empty dict for JSONB
+                'report_content': report_content,  # report_content must be non-empty
+                'summary': report_data.get('summary', {}),  # Default to empty dict for JSONB
                 'scores': report_data.get('scores', {}),   # Default to empty dict for JSONB
                 'recommendations': report_data.get('recommendations', ''),
                 'created_at': datetime.now().isoformat()
                 # updated_at is handled by a database trigger
             }
-            
+
+            logger.info(f"💾 Sending to DB - user_id: {safe_report_data['user_id']}, title: {safe_report_data['title']}")
+            logger.info(f"💾 Report content length: {len(report_content)} characters")
+            logger.info(f"💾 Session ID: {session_id}")
+
             response = self.client.table('interview_reports').insert(safe_report_data).execute()
             
             if response.data:
-                return response.data[0]['id']
+                report_id = response.data[0]['id']
+                logger.info(f"✅ Report saved successfully with ID: {report_id}")
+                return report_id
             else:
                 # Log the actual error from Supabase if available in response.error
                 if hasattr(response, 'error') and response.error:
-                    logger.error(f"Supabase error saving report: {response.error.message if hasattr(response.error, 'message') else response.error}")
+                    logger.error(f"❌ Supabase error saving report: {response.error.message if hasattr(response.error, 'message') else response.error}")
                 else:
-                    logger.error("Failed to save interview report, no data returned and no specific Supabase error info.")
+                    logger.error("❌ Failed to save interview report, no data returned and no specific Supabase error info.")
                 return None
         except Exception as e:
-            logger.error(f"Exception in save_interview_report: {e}")
+            logger.error(f"❌ Exception in save_interview_report: {e}")
+            logger.error(f"❌ Exception type: {type(e).__name__}")
+            import traceback
+            logger.error(f"❌ Full traceback: {traceback.format_exc()}")
             return None
     
     def get_user_reports(self, user_id: str, limit: int = 50) -> List[Dict[str, Any]]:
         """Get all reports for a user"""
+        logger.info(f"🔍 Fetching reports for user: {user_id}, limit: {limit}")
+        
         try:
             response = (self.client.table('interview_reports')
                        .select('id, title, created_at')
@@ -313,9 +438,32 @@ class SupabaseManager:
                        .order('created_at', desc=True)
                        .limit(limit)
                        .execute())
-            return response.data if response.data else []
+            
+            reports = response.data if response.data else []
+            logger.info(f"📊 Found {len(reports)} reports for user {user_id}")
+            
+            if reports:
+                # Log first report details for debugging
+                first_report = reports[0]
+                logger.info(f"📋 First report sample - ID: {first_report.get('id')}, title: {first_report.get('title')}")
+            else:
+                logger.info("📋 No reports found - checking if user has any reports at all...")
+                # Debug query to see if user has any reports at all
+                all_reports_response = (self.client.table('interview_reports')
+                                      .select('user_id, id, title')
+                                      .limit(5)
+                                      .execute())
+                if all_reports_response.data:
+                    logger.info(f"📋 Sample of all reports in DB: {all_reports_response.data}")
+                else:
+                    logger.info("📋 No reports found in entire table")
+            
+            return reports
         except Exception as e:
-            logger.error(f"Error fetching user reports: {e}")
+            logger.error(f"❌ Error fetching user reports: {e}")
+            logger.error(f"❌ Exception type: {type(e).__name__}")
+            import traceback
+            logger.error(f"❌ Full traceback: {traceback.format_exc()}")
             return []
     
     def get_report(self, report_id: str) -> Optional[Dict[str, Any]]:
