@@ -110,7 +110,7 @@ class RealInterviewFlowTester:
                 
                 data = {
                     'max_questions': max_questions,
-                    'model_name': 'gpt-4o-mini'
+                    'model_name': 'gpt-4.1-nano-2025-04-14'
                 }
                 
                 response = self.session.post(

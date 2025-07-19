@@ -21,7 +21,7 @@ class InterviewConfigAPI(BaseModel):
     chunk_overlap: int = 150
     rag_k_results: int = 3
     temperature: float = 0.3
-    model_name: str = "gpt-4o-mini"
+    model_name: str = "gpt-4.1-nano-2025-04-14"
     index_path: str = "./vector_stores/interview_faiss_index"
 
 class StartInterviewRequest(BaseModel):
@@ -73,14 +73,14 @@ app.add_middleware(
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     print(f"[MIDDLEWARE] {request.method} {request.url}")
-    print(f"[MIDDLEWARE] Headers: {dict(request.headers)}")
     
-    # Check specifically for Authorization header
-    auth_header = request.headers.get("authorization")
-    if auth_header:
-        print(f"[MIDDLEWARE] Authorization header present: {auth_header[:20]}...")
-    else:
-        print(f"[MIDDLEWARE] No authorization header found")
+    # Only log authorization header presence/absence for non-OPTIONS requests
+    if request.method != "OPTIONS":
+        auth_header = request.headers.get("authorization")
+        if auth_header:
+            print(f"[MIDDLEWARE] Authorization header present")
+        else:
+            print(f"[MIDDLEWARE] No authorization header found")
     
     response = await call_next(request)
     print(f"[MIDDLEWARE] Response status: {response.status_code}")
@@ -97,23 +97,13 @@ security = HTTPBearer(auto_error=False)
 
 print("[STARTUP] Server initialized with security and middleware")
 
-# Security
-security = HTTPBearer()
-
 # Global variables (consider using dependency injection for production)
-supabase_manager = SupabaseManager()
 active_sessions: Dict[str, Dict[str, Any]] = {}
 
 def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     """Get current user from JWT token"""
-    print(f"DEBUG: get_current_user called")
-    print(f"DEBUG: credentials received: {credentials}")
-    print(f"DEBUG: credentials.credentials: {credentials.credentials}")
-    print(f"DEBUG: settings.ENVIRONMENT: {settings.ENVIRONMENT}")
-    
     # For development: Accept dummy token and return mock user
     if settings.ENVIRONMENT == "development" and credentials.credentials == "dummy-token":
-        print("DEBUG: Using development dummy token authentication")
         # Return a mock user object for development
         return type('User', (), {
             'id': '176d665a-4932-4934-a03d-5519301517f5',
@@ -123,29 +113,24 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
 
     # Try to validate JWT using Supabase JWKS
     token = credentials.credentials
-    print(f"DEBUG: Attempting JWT validation for token: {token[:20]}...")
     
     try:
         # First try simple JWT decode without verification for debugging
         import jwt
         unverified_payload = jwt.decode(token, options={"verify_signature": False})
-        print(f"DEBUG: Unverified JWT payload: {unverified_payload}")
         
         # For now, if we can decode the JWT (even unverified), accept it
         # This is for development - in production you'd want full verification
         if unverified_payload.get('aud') == 'authenticated':
-            print("DEBUG: JWT appears valid (unverified), accepting user")
             return type('User', (), unverified_payload)()
         
         # Try full verification
         from jwt import PyJWKClient
         SUPABASE_PROJECT_ID = os.getenv("SUPABASE_PROJECT_ID") or "ikaebwiruhrnsgjinojh"
         JWKS_URL = f"https://{SUPABASE_PROJECT_ID}.supabase.co/auth/v1/keys"
-        print(f"DEBUG: JWKS URL: {JWKS_URL}")
         
         jwks_client = PyJWKClient(JWKS_URL)
         signing_key = jwks_client.get_signing_key_from_jwt(token)
-        print(f"DEBUG: Got signing key: {signing_key}")
         
         decoded = jwt.decode(
             token,
@@ -154,12 +139,9 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
             audience="authenticated",
             options={"verify_aud": True}
         )
-        print(f"DEBUG: JWT decoded successfully: {decoded}")
         return type('User', (), decoded)()
         
     except Exception as e:
-        print(f"DEBUG: JWT validation failed: {e}")
-        print(f"DEBUG: Error type: {type(e)}")
         raise HTTPException(status_code=401, detail=f"Invalid authentication token: {str(e)}")
 
 def create_interview_system(config: InterviewConfigAPI = None) -> InterviewSystem:
@@ -196,7 +178,7 @@ async def test_start_interview(
     resume: UploadFile = File(...),
     job_description: UploadFile = File(...),
     max_questions: int = Form(3),
-    model_name: str = Form("gpt-4o-mini")
+    model_name: str = Form("gpt-4.1-nano-2025-04-14")
 ):
     """Start a new interview session (test endpoint without auth)"""
     try:
@@ -362,16 +344,17 @@ async def start_interview(
     resume: UploadFile = File(...),
     job_description: UploadFile = File(...),
     max_questions: int = Form(3),
-    model_name: str = Form("gpt-4o-mini"),
+    model_name: str = Form("gpt-4.1-nano-2025-04-14"),
     temperature: float = Form(0.3),
     current_user=Depends(get_current_user)
 ):
     """Start a new interview session"""
-    print(f"DEBUG: start_interview endpoint called")
-    print(f"DEBUG: current_user: {current_user}")
-    print(f"DEBUG: max_questions: {max_questions}, model_name: {model_name}, temperature: {temperature}")
-    print(f"DEBUG: resume file: {resume.filename}, content_type: {resume.content_type}, size: {resume.size}")
-    print(f"DEBUG: job_description file: {job_description.filename}, content_type: {job_description.content_type}, size: {job_description.size}")
+    user_id = getattr(current_user, 'sub', getattr(current_user, 'id', None))
+    print(f"Starting interview for user: {user_id}")
+    print(f"Config: max_questions={max_questions}, model={model_name}, temp={temperature}")
+    
+    resume_path = None
+    job_path = None
     
     try:
         # Save uploaded files temporarily
@@ -397,30 +380,36 @@ async def start_interview(
         session_id = str(uuid.uuid4())
         interview_state = interview_system.start_interactive_interview(resume_path, job_path)
         
-        # Store session
+        # Store session in memory
         active_sessions[session_id] = {
             "interview_system": interview_system,
             "interview_state": interview_state,
-            "user_id": current_user.id,
+            "user_id": getattr(current_user, 'sub', getattr(current_user, 'id', None)),
             "created_at": datetime.now().isoformat()
         }
         
         # Get first question
         question = interview_system.get_next_question(interview_state)
         
-        # Save to database
-        session_data = {
-            "user_id": current_user.id,
-            "status": "active",
-            "total_questions": len(interview_state.get('interview_plan', [])),
-            "current_question_idx": interview_state.get('current_question_idx', 0),
-            "interview_state": interview_state
-        }
-        supabase_manager.create_interview_session(current_user.id, session_data)
-        
-        # Clean up temp files
-        os.unlink(resume_path)
-        os.unlink(job_path)
+        # Save minimal session data to database (not the full interview_state)
+        try:
+            session_data = {
+                "user_id": getattr(current_user, 'sub', getattr(current_user, 'id', None)),
+                "status": "active",
+                "total_questions": len(interview_state.get('interview_plan', [])),
+                "current_question_idx": interview_state.get('current_question_idx', 0),
+                "resume_content": resume.filename,
+                "job_description": job_description.filename,
+                "title": f"Interview Session {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+            }
+            db_session_id = supabase_manager.create_interview_session(
+                getattr(current_user, 'sub', getattr(current_user, 'id', None)), 
+                session_data
+            )
+            print(f"✅ Session saved to database: {db_session_id}")
+        except Exception as db_error:
+            print(f"⚠️ Failed to save session to database: {db_error}")
+            # Don't fail the entire request if DB save fails
         
         return InterviewResponse(
             session_id=session_id,
@@ -431,7 +420,20 @@ async def start_interview(
         )
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to start interview: {e}")
+        import traceback
+        print(f"❌ Error in start_interview: {e}")
+        print(f"Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Failed to start interview: {str(e)}")
+        
+    finally:
+        # Clean up temp files
+        try:
+            if resume_path:
+                os.unlink(resume_path)
+            if job_path:
+                os.unlink(job_path)
+        except Exception as cleanup_error:
+            print(f"⚠️ Failed to clean up temporary files: {cleanup_error}")
 
 @app.post("/interview/answer", response_model=AnalysisResponse)
 async def submit_answer(
@@ -500,9 +502,12 @@ async def get_interview_report(
         # Generate final report
         final_state = interview_system.generate_final_report(interview_state)
         
+        # Get user ID
+        user_id = getattr(current_user, 'sub', getattr(current_user, 'id', None))
+        
         # Save report to database
         report_data = {
-            "user_id": current_user.id,
+            "user_id": user_id,
             "session_id": session_id,
             "title": f"Interview Report - {datetime.now().strftime('%Y-%m-%d %H:%M')}",
             "content": final_state.get('interview_report', ''),
@@ -510,7 +515,7 @@ async def get_interview_report(
         }
         
         report_id = supabase_manager.save_interview_report(
-            current_user.id, 
+            user_id, 
             session_id, 
             report_data
         )
@@ -531,10 +536,26 @@ async def get_user_sessions(
 ):
     """Get user's interview sessions"""
     try:
-        sessions = supabase_manager.get_user_interview_sessions(current_user.id, limit)
-        return {"sessions": sessions}
+        user_id = getattr(current_user, 'sub', getattr(current_user, 'id', None))
+        print(f"🔍 Fetching sessions for user: {user_id}")
+        
+        sessions = supabase_manager.get_user_interview_sessions(user_id, limit)
+        print(f"🔍 Raw sessions from DB: {type(sessions)} - {sessions}")
+        
+        # Ensure we always return an array, even if empty or None
+        if not isinstance(sessions, list):
+            print(f"⚠️ Sessions is not a list, type: {type(sessions)}, converting to empty array")
+            sessions = []
+        
+        response = {"sessions": sessions}
+        print(f"🔍 Final response: {response}")
+        return response
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to retrieve sessions: {e}")
+        print(f"❌ Error fetching sessions: {e}")
+        import traceback
+        print(f"❌ Traceback: {traceback.format_exc()}")
+        # Return empty array on error to prevent frontend crashes
+        return {"sessions": []}
 
 @app.get("/reports")
 async def get_user_reports(
@@ -543,19 +564,45 @@ async def get_user_reports(
 ):
     """Get user's interview reports"""
     try:
-        reports = supabase_manager.get_user_reports(current_user.id, limit)
+        user_id = getattr(current_user, 'sub', getattr(current_user, 'id', None))
+        reports = supabase_manager.get_user_reports(user_id, limit)
+        
+        # Ensure we always return an array, even if empty or None
+        if not isinstance(reports, list):
+            reports = []
+            
         return {"reports": reports}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to retrieve reports: {e}")
+        print(f"❌ Error fetching reports: {e}")
+        # Return empty array on error to prevent frontend crashes
+        return {"reports": []}
 
 @app.get("/dashboard/stats")
 async def get_dashboard_stats(current_user=Depends(get_current_user)):
     """Get user dashboard statistics"""
     try:
-        stats = supabase_manager.get_user_dashboard_stats(current_user.id)
+        user_id = getattr(current_user, 'sub', getattr(current_user, 'id', None))
+        stats = supabase_manager.get_user_dashboard_stats(user_id)
+        
+        # Ensure we always return a valid stats object
+        if not isinstance(stats, dict):
+            stats = {
+                "total_interviews": 0,
+                "completed_interviews": 0,
+                "average_score": 0,
+                "total_reports": 0
+            }
+            
         return stats
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to retrieve stats: {e}")
+        print(f"❌ Error fetching dashboard stats: {e}")
+        # Return default stats on error
+        return {
+            "total_interviews": 0,
+            "completed_interviews": 0,
+            "average_score": 0,
+            "total_reports": 0
+        }
 
 # Admin endpoints (optional)
 @app.get("/admin/health")

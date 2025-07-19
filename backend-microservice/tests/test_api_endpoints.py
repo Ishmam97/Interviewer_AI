@@ -182,7 +182,7 @@ class APITestSuite:
                 
                 data = {
                     'max_questions': 3,
-                    'model_name': 'gpt-4o-mini'
+                    'model_name': 'gpt-4.1-nano-2025-04-14'
                 }
                 
                 response = self.session.post(
@@ -231,7 +231,7 @@ class APITestSuite:
                 request_data = {
                     "config": {
                         "max_questions": 3,
-                        "model_name": "gpt-4o-mini",
+                        "model_name": "gpt-4.1-nano-2025-04-14",
                         "temperature": 0.3
                     }
                 }

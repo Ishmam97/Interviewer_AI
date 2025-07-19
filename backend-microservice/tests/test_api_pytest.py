@@ -141,7 +141,7 @@ class TestAPIEndpoints:
                 
                 data = {
                     'max_questions': 3,
-                    'model_name': 'gpt-4o-mini'
+                    'model_name': 'gpt-4.1-nano-2025-04-14'
                 }
                 
                 response = self.session.post(
@@ -184,7 +184,7 @@ class TestAPIEndpoints:
                 
                 data = {
                     'max_questions': 3,
-                    'model_name': 'gpt-4o-mini'
+                    'model_name': 'gpt-4.1-nano-2025-04-14'
                 }
                 
                 response = self.session.post(
@@ -203,7 +203,7 @@ class TestAPIEndpoints:
         """Test interview start with missing files"""
         data = {
             'max_questions': 3,
-            'model_name': 'gpt-4o-mini'
+            'model_name': 'gpt-4.1-nano-2025-04-14'
         }
         
         response = self.session.post(
@@ -434,7 +434,7 @@ class TestInterviewFlow:
                 
                 data = {
                     'max_questions': 2,  # Keep it short for testing
-                    'model_name': 'gpt-4o-mini'
+                    'model_name': 'gpt-4.1-nano-2025-04-14'
                 }
                 
                 response = self.session.post(

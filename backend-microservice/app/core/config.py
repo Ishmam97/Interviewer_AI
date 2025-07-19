@@ -44,7 +44,7 @@ class Settings(BaseSettings):
     
     # AI/ML
     OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
-    DEFAULT_MODEL: str = os.getenv("DEFAULT_MODEL", "gpt-4o-mini")
+    DEFAULT_MODEL: str = os.getenv("DEFAULT_MODEL", "gpt-4.1-nano-2025-04-14")
     
     # Interview Configuration
     MAX_QUESTIONS: int = int(os.getenv("MAX_QUESTIONS", "5"))

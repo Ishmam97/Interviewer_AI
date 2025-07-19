@@ -117,7 +117,7 @@ class SupabaseManager:
                 default_settings = {
                     'user_id': user_id,
                     'max_questions': 5,
-                    'model_name': 'gpt-4o-mini',
+                    'model_name': 'gpt-4.1-nano-2025-04-14',
                     'temperature': 0.3,
                     'chunk_size': 500,
                     'chunk_overlap': 50
@@ -129,7 +129,7 @@ class SupabaseManager:
             # Return default settings on error
             return {
                 'max_questions': 5,
-                'model_name': 'gpt-4o-mini',
+                'model_name': 'gpt-4.1-nano-2025-04-14',
                 'temperature': 0.3,
                 'chunk_size': 500,
                 'chunk_overlap': 50

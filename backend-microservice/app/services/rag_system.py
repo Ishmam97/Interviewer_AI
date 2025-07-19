@@ -1,19 +1,46 @@
 from typing import List, Tuple, Optional
 from langchain.schema import Document
-from langchain_community.vectorstores import FAISS
 from langchain_openai import OpenAIEmbeddings
+import os
+
+# Try to import FAISS with fallback to CPU version
+try:
+    from langchain_community.vectorstores import FAISS
+    FAISS_AVAILABLE = True
+    print("✅ FAISS with GPU support loaded")
+except ImportError as e:
+    print(f"⚠️ Failed to load FAISS: {e}")
+    try:
+        # Try to install and import faiss-cpu as fallback
+        import subprocess
+        import sys
+        print("🔄 Attempting to install faiss-cpu as fallback...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "faiss-cpu"])
+        from langchain_community.vectorstores import FAISS
+        FAISS_AVAILABLE = True
+        print("✅ FAISS CPU fallback installed and loaded")
+    except Exception as fallback_error:
+        print(f"❌ Failed to install faiss-cpu fallback: {fallback_error}")
+        FAISS_AVAILABLE = False
 
 
 class RAGSystem:
     """Manages vector store operations for RAG functionality"""
     
     def __init__(self, embeddings: OpenAIEmbeddings, index_path: str = "./interview_faiss_index"):
+        if not FAISS_AVAILABLE:
+            raise ImportError("FAISS is not available. Please install faiss-cpu or faiss-gpu")
+        
         self.embeddings = embeddings
         self.index_path = index_path
         self.vector_store: Optional[FAISS] = None
     
     def load_existing_index(self) -> bool:
         """Load existing FAISS index if available"""
+        if not FAISS_AVAILABLE:
+            print("❌ FAISS not available, cannot load index")
+            return False
+            
         try:
             self.vector_store = FAISS.load_local(
                 self.index_path, 
@@ -31,15 +58,34 @@ class RAGSystem:
     
     def create_index(self, documents: List[Document]) -> None:
         """Create new FAISS index from documents"""
+        if not FAISS_AVAILABLE:
+            raise ImportError("FAISS is not available, cannot create index")
+            
         print("🔧 Building new FAISS index...")
         
-        self.vector_store = FAISS.from_documents(
-            documents=documents,
-            embedding=self.embeddings
-        )
-        
-        self.save_index()
-        print("💾 FAISS index saved successfully")
+        try:
+            self.vector_store = FAISS.from_documents(
+                documents=documents,
+                embedding=self.embeddings
+            )
+            
+            self.save_index()
+            print("💾 FAISS index saved successfully")
+        except Exception as e:
+            print(f"❌ Failed to create FAISS index: {e}")
+            # Try with CPU-only settings if available
+            try:
+                import faiss
+                faiss.omp_set_num_threads(1)  # Use single thread for CPU
+                self.vector_store = FAISS.from_documents(
+                    documents=documents,
+                    embedding=self.embeddings
+                )
+                self.save_index()
+                print("💾 FAISS index created with CPU fallback")
+            except Exception as cpu_error:
+                print(f"❌ CPU fallback also failed: {cpu_error}")
+                raise
     
     def save_index(self) -> None:
         """Save current FAISS index"""

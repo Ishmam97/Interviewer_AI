@@ -67,7 +67,7 @@ SUPABASE_SERVICE_KEY=your-supabase-service-key
 
 # AI/ML
 OPENAI_API_KEY=your-openai-api-key
-DEFAULT_MODEL=gpt-4o-mini
+DEFAULT_MODEL=gpt-4.1-nano-2025-04-14
 
 # Interview Configuration
 MAX_QUESTIONS=5
