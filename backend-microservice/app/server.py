@@ -406,7 +406,7 @@ async def start_interview(
                 getattr(current_user, 'sub', getattr(current_user, 'id', None)), 
                 session_data
             )
-            print(f"✅ Session saved to database: {db_session_id}")
+            print(f"✅ Session save attempted, db_session_id: {db_session_id}")
         except Exception as db_error:
             print(f"⚠️ Failed to save session to database: {db_error}")
             # Don't fail the entire request if DB save fails
@@ -505,26 +505,27 @@ async def get_interview_report(
         # Get user ID
         user_id = getattr(current_user, 'sub', getattr(current_user, 'id', None))
         
-        # Save report to database
-        report_data = {
-            "user_id": user_id,
-            "session_id": session_id,
-            "title": f"Interview Report - {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-            "content": final_state.get('interview_report', ''),
-            "overall_score": session.get("overall_score", 0)
-        }
-        
-        report_id = supabase_manager.save_interview_report(
-            user_id, 
-            session_id, 
-            report_data
-        )
-        
-        return {
-            "report_id": report_id,
-            "content": final_state.get('interview_report', ''),
-            "session_id": session_id
-        }
+            # Save report to database
+            report_data = {
+                "user_id": user_id,
+                "session_id": session_id,
+                "title": f"Interview Report - {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+                "report_content": final_state.get('interview_report', ''),
+                "overall_score": session.get("overall_score", 0)
+            }
+            
+            report_id = supabase_manager.save_interview_report(
+                user_id, 
+                session_id, 
+                report_data
+            )
+            print(f"✅ Report save attempted, report_id: {report_id}")
+            
+            return {
+                "report_id": report_id,
+                "content": final_state.get('interview_report', ''),
+                "session_id": session_id
+            }
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to generate report: {e}")
@@ -590,7 +591,7 @@ async def get_dashboard_stats(current_user=Depends(get_current_user)):
                 "total_interviews": 0,
                 "completed_interviews": 0,
                 "average_score": 0,
-                "total_reports": 0
+                print(f"✅ Session save attempted, db_session_id: {db_session_id}")
             }
             
         return stats
