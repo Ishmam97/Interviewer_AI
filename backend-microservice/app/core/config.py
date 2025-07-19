@@ -8,6 +8,8 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
+    # Custom DB password for legacy/compatibility
+    db_pass: str = os.getenv("DB_PASS", "")
     """Application settings"""
     
     # Application
