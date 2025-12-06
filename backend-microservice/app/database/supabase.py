@@ -373,7 +373,7 @@ class SupabaseManager:
             return False
     
     def save_interview_report(self, user_id: str, session_id: Optional[str], report_data: Dict[str, Any]) -> Optional[str]:
-        """Save an interview report"""
+        """Save or update an interview report"""
         logger.info(f"🔄 Saving interview report for user: {user_id}, session: {session_id}")
         logger.info(f"📋 Input report_data keys: {list(report_data.keys())}")
 
@@ -391,6 +391,9 @@ class SupabaseManager:
                 logger.error("❌ Attempted to save report with empty content.")
                 return None
 
+            # Check if a report already exists for the user and session
+            existing_report = self.client.table('interview_reports').select("id").eq("user_id", user_id).eq("session_id", session_id).execute()
+
             safe_report_data = {
                 'user_id': user_id,
                 'session_id': session_id,  # This will be None if session_id is None
@@ -403,23 +406,29 @@ class SupabaseManager:
                 # updated_at is handled by a database trigger
             }
 
-            logger.info(f"💾 Sending to DB - user_id: {safe_report_data['user_id']}, title: {safe_report_data['title']}")
-            logger.info(f"💾 Report content length: {len(report_content)} characters")
-            logger.info(f"💾 Session ID: {session_id}")
-
-            response = self.client.table('interview_reports').insert(safe_report_data).execute()
-            
-            if response.data:
-                report_id = response.data[0]['id']
-                logger.info(f"✅ Report saved successfully with ID: {report_id}")
-                return report_id
-            else:
-                # Log the actual error from Supabase if available in response.error
-                if hasattr(response, 'error') and response.error:
-                    logger.error(f"❌ Supabase error saving report: {response.error.message if hasattr(response.error, 'message') else response.error}")
+            if existing_report.data:
+                # Update the existing report
+                report_id = existing_report.data[0]['id']
+                response = self.client.table('interview_reports').update(safe_report_data).eq("id", report_id).execute()
+                if response.data:
+                    logger.info(f"✅ Report updated successfully with ID: {report_id}")
+                    return report_id
                 else:
-                    logger.error("❌ Failed to save interview report, no data returned and no specific Supabase error info.")
-                return None
+                    logger.error("❌ Failed to update interview report.")
+                    return None
+            else:
+                # Insert a new report
+                response = self.client.table('interview_reports').insert(safe_report_data).execute()
+                if response.data:
+                    report_id = response.data[0]['id']
+                    logger.info(f"✅ Report saved successfully with ID: {report_id}")
+                    return report_id
+                else:
+                    if hasattr(response, 'error') and response.error:
+                        logger.error(f"❌ Supabase error saving report: {response.error.message if hasattr(response.error, 'message') else response.error}")
+                    else:
+                        logger.error("❌ Failed to save interview report, no data returned and no specific Supabase error info.")
+                    return None
         except Exception as e:
             logger.error(f"❌ Exception in save_interview_report: {e}")
             logger.error(f"❌ Exception type: {type(e).__name__}")

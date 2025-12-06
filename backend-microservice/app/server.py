@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, Form, Request
+from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, Form, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
@@ -7,7 +7,7 @@ import os
 import tempfile
 import uuid
 from datetime import datetime
-
+import uvicorn
 from app.services.interview_system import InterviewSystem
 from app.models.interview_models import InterviewState
 from app.models.interview_models import InterviewConfig as CoreInterviewConfig
@@ -458,38 +458,39 @@ async def start_interview(
 @app.post("/interview/answer", response_model=AnalysisResponse)
 async def submit_answer(
     request: AnswerRequest,
+    background_tasks: BackgroundTasks,
     current_user=Depends(get_current_user)
 ):
     """Submit an answer to the current question"""
     try:
         if request.session_id not in active_sessions:
             raise HTTPException(status_code=404, detail="Interview session not found")
-        
+
         session = active_sessions[request.session_id]
         interview_system = session["interview_system"]
         interview_state = session["interview_state"]
         user_id = getattr(current_user, 'sub', getattr(current_user, 'id', None))
-        
+
         print(f"📝 Processing answer for session {request.session_id}")
         print(f"📋 Current question index: {interview_state.get('current_question_idx', 0)}")
         print(f"📋 Total questions in plan: {len(interview_state.get('interview_plan', []))}")
-        
+
         # Process the answer
         updated_state = interview_system.process_candidate_answer(interview_state, request.answer)
         session["interview_state"] = updated_state
-        
+
         # Get latest score
         latest_note = updated_state.get('interview_notes', [])[-1] if updated_state.get('interview_notes') else None
         score = latest_note.get('score', 0) if latest_note else 0
         analysis = latest_note.get('analysis', '') if latest_note else ''
-        
+
         # Check if interview is complete - use the configured max_questions, not just plan length
         current_idx = updated_state.get('current_question_idx', 0)
         total_questions = len(updated_state.get('interview_plan', []))
         is_complete = current_idx >= total_questions
-        
+
         print(f"📊 After processing: current_idx={current_idx}, total_questions={total_questions}, is_complete={is_complete}")
-        
+
         # Update progress in the database
         try:
             progress = round((current_idx / total_questions) * 100, 2)
@@ -502,79 +503,64 @@ async def submit_answer(
             supabase_manager.update_interview_session(request.session_id, session_update_data, user_id)
         except Exception as e:
             print(f"⚠️ Failed to update session progress: {e}")
-        
+
         # Get next question if not complete
         next_question = None
         if not is_complete:
             next_question = interview_system.get_next_question(updated_state)
             print(f"❓ Next question: {next_question[:100] if next_question else 'None'}...")
-        else:
-            print("🎯 Interview complete! Generating final report...")
-            
-            # Generate final report when interview is complete
-            try:
-                final_state = interview_system.generate_final_report(updated_state)
-                session["interview_state"] = final_state
-                
-                # Calculate overall score from all notes
-                all_scores = [note.get('score', 0) for note in final_state.get('interview_notes', []) if note.get('score') is not None]
-                overall_score = sum(all_scores) / len(all_scores) if all_scores else 0
-                session["overall_score"] = overall_score
-                
-                # Save final session to database
-                final_session_data = {
-                    "status": "completed",
-                    "current_question_idx": current_idx,
-                    "total_questions": total_questions,
-                    "average_score": overall_score,
-                    "final_report": final_state.get('interview_report', ''),
-                    "interview_notes": final_state.get('interview_notes', []),
-                    "conversation_history": final_state.get('conversation_history', [])
-                }
-                
-                print(f"💾 Saving completed session to DB...")
-                session_updated = supabase_manager.update_interview_session(request.session_id, final_session_data, user_id)
-                if session_updated:
-                    print(f"✅ Session updated successfully in DB")
-                else:
-                    print(f"⚠️ Session update failed - session might not exist in DB")
-                
-                print(f"✅ Interview completed with overall score: {overall_score}")
-                
-                # Save report to database
-                report_data = {
-                    "user_id": user_id,
-                    "session_id": request.session_id,
-                    "title": f"Interview Report - {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-                    "report_content": final_state.get('interview_report', ''),
-                    "summary": {"overall_score": overall_score, "total_questions": total_questions},
-                    "scores": {"individual_scores": all_scores, "average": overall_score}
-                }
-                
-                print(f"🔄 Attempting to save report to DB for completed interview...")
-                report_id = supabase_manager.save_interview_report(
-                    user_id, 
-                    request.session_id, 
-                    report_data
-                )
-                
-                if report_id:
-                    print(f"✅ Report saved successfully to DB with ID: {report_id}")
-                else:
-                    print(f"❌ Report save failed - check supabase logs above")
-                    
-            except Exception as report_error:
-                print(f"⚠️ Error generating final report: {report_error}")
-                # Continue with the response even if report generation fails
-        
+
+        # If complete, generate the report in the background
+        if is_complete:
+            def generate_report():
+                try:
+                    print("🎯 Interview complete! Generating final report...")
+                    final_state = interview_system.generate_final_report(updated_state)
+                    session["interview_state"] = final_state
+
+                    # Calculate overall score
+                    all_scores = [note.get('score', 0) for note in final_state.get('interview_notes', []) if note.get('score') is not None]
+                    overall_score = sum(all_scores) / len(all_scores) if all_scores else 0
+                    session["overall_score"] = overall_score
+
+                    # Save final session to database
+                    final_session_data = {
+                        "status": "completed",
+                        "current_question_idx": current_idx,
+                        "total_questions": total_questions,
+                        "average_score": overall_score,
+                        "final_report": final_state.get('interview_report', ''),
+                        "interview_notes": final_state.get('interview_notes', []),
+                        "conversation_history": final_state.get('conversation_history', [])
+                    }
+
+                    print(f"💾 Saving completed session to DB...")
+                    supabase_manager.update_interview_session(request.session_id, final_session_data, user_id)
+
+                    # Save report to database
+                    report_data = {
+                        "user_id": user_id,
+                        "session_id": request.session_id,
+                        "title": f"Interview Report - {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+                        "report_content": final_state.get('interview_report', ''),
+                        "summary": {"overall_score": overall_score, "total_questions": total_questions},
+                        "scores": {"individual_scores": all_scores, "average": overall_score}
+                    }
+
+                    print(f"🔄 Attempting to save report to DB for completed interview...")
+                    supabase_manager.save_interview_report(user_id, request.session_id, report_data)
+                except Exception as report_error:
+                    print(f"⚠️ Error generating final report: {report_error}")
+
+            background_tasks.add_task(generate_report)
+
         return AnalysisResponse(
-            session_id=request.session_id,
+            session_id=request.session_id,  # Include session_id in the response
+            next_question=next_question,
             score=score,
             analysis=analysis,
-            is_complete=is_complete,
-            next_question=next_question
+            is_complete=is_complete
         )
-        
     except Exception as e:
         print(f"❌ Error in submit_answer: {e}")
         import traceback
@@ -586,50 +572,53 @@ async def get_interview_report(
     session_id: str,
     current_user=Depends(get_current_user)
 ):
-    """Generate and retrieve interview report"""
-    try:
-        if session_id not in active_sessions:
-            raise HTTPException(status_code=404, detail="Interview session not found")
-        
+    """Retrieve interview report: generate if active, otherwise fetch latest from DB"""
+    user_id = getattr(current_user, 'sub', getattr(current_user, 'id', None))
+
+    # Active session path: generate fresh report and save
+    if session_id in active_sessions:
         session = active_sessions[session_id]
         interview_system = session["interview_system"]
         interview_state = session["interview_state"]
-        
-        # Generate final report
         final_state = interview_system.generate_final_report(interview_state)
-        
-        # Get user ID
-        user_id = getattr(current_user, 'sub', getattr(current_user, 'id', None))
-        # Save report to database
+
         report_data = {
             "user_id": user_id,
             "session_id": session_id,
             "title": f"Interview Report - {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-            "report_content": final_state.get('interview_report', ''),
-            "overall_score": session.get("overall_score", 0)
+            "report_content": final_state.get("interview_report", ""),
         }
-        
         print(f"🔄 Attempting to save report to DB for user: {user_id}, session: {session_id}")
-        print(f"📋 Report data - title: {report_data['title']}, content length: {len(report_data['report_content'])}")
-        
-        report_id = supabase_manager.save_interview_report(
-            user_id, 
-            session_id, 
-            report_data
-        )
-        
+        report_id = supabase_manager.save_interview_report(user_id, session_id, report_data)
         if report_id:
             print(f"✅ Report saved successfully to DB with ID: {report_id}")
-        else:
-            print(f"❌ Report save returned None - check supabase logs above")
         return {
             "report_id": report_id,
-            "content": final_state.get('interview_report', ''),
+            "content": final_state.get("interview_report", ""),
             "session_id": session_id
         }
-        
+
+    # Inactive session path: fetch existing report
+    try:
+        resp = (
+            supabase_manager.client
+            .table("interview_reports")
+            .select("id, report_content")
+            .eq("session_id", session_id)
+            .eq("user_id", user_id)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if resp.data:
+            rep = resp.data[0]
+            return {"report_id": rep["id"], "content": rep["report_content"], "session_id": session_id}
+        raise HTTPException(status_code=404, detail="Report not found")
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to generate report: {e}")
+        print(f"⚠️ Failed to fetch report from DB: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch report: {e}")
 
 @app.get("/interview/sessions")
 async def get_user_sessions(
@@ -724,7 +713,7 @@ async def admin_health():
         }
 
 if __name__ == "__main__":
-    import uvicorn
+    
     uvicorn.run(
         "app.server:app",
         host=settings.HOST,
