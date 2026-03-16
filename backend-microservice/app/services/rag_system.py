@@ -1,6 +1,6 @@
 from typing import List, Tuple, Optional
-from langchain.schema import Document
-from langchain_openai import OpenAIEmbeddings
+from langchain_core.documents import Document
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
 import os
 
 # Try to import FAISS with fallback to CPU version
@@ -27,7 +27,7 @@ except ImportError as e:
 class RAGSystem:
     """Manages vector store operations for RAG functionality"""
     
-    def __init__(self, embeddings: OpenAIEmbeddings, index_path: str = "./interview_faiss_index"):
+    def __init__(self, embeddings: GoogleGenerativeAIEmbeddings, index_path: str = "./interview_faiss_index"):
         if not FAISS_AVAILABLE:
             raise ImportError("FAISS is not available. Please install faiss-cpu or faiss-gpu")
         

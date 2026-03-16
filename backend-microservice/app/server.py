@@ -1,723 +1,645 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, Form, Request, BackgroundTasks
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel
-from typing import List, Optional, Dict, Any
+"""
+FastAPI backend for AI Interview Assistant (Firebase + Gemini)
+"""
+
+import asyncio
+import logging
 import os
 import tempfile
 import uuid
 from datetime import datetime
+from typing import Any, Dict, List, Optional
+
 import uvicorn
-from app.services.interview_system import InterviewSystem
-from app.models.interview_models import InterviewState
-from app.models.interview_models import InterviewConfig as CoreInterviewConfig
-from app.database.supabase import SupabaseManager
+from fastapi import (
+    Depends, File, Form, FastAPI, HTTPException, Request,
+    UploadFile, WebSocket, WebSocketDisconnect,
+)
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel
+
 from app.core.config import settings
+from app.database.firebase_db import FirebaseManager
 
-# Pydantic models for API
-class InterviewConfigAPI(BaseModel):
-    max_questions: int = 5
-    chunk_size: int = 800
-    chunk_overlap: int = 150
-    rag_k_results: int = 3
-    temperature: float = 0.3
-    model_name: str = "gpt-4.1-nano-2025-04-14"
-    index_path: str = "./vector_stores/interview_faiss_index"
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
-class StartInterviewRequest(BaseModel):
-    config: Optional[InterviewConfigAPI] = None
+# ── App ───────────────────────────────────────────────────────────────────────
 
-class AnswerRequest(BaseModel):
-    session_id: str
-    answer: str
+app = FastAPI(
+    title="AI Interview Assistant",
+    version=settings.VERSION,
+    docs_url="/docs",
+    redoc_url="/redoc",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    logger.info(f"{request.method} {request.url}")
+    response = await call_next(request)
+    logger.info(f"Response status: {response.status_code}")
+    return response
+
+
+# ── Firebase singleton ────────────────────────────────────────────────────────
+
+_firebase_manager: Optional[FirebaseManager] = None
+
+
+def get_firebase_manager() -> FirebaseManager:
+    global _firebase_manager
+    if _firebase_manager is None:
+        _firebase_manager = FirebaseManager()
+    return _firebase_manager
+
+
+# ── Auth ──────────────────────────────────────────────────────────────────────
+
+_security = HTTPBearer(auto_error=False)
+
+
+def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(_security)):
+    if not credentials:
+        raise HTTPException(status_code=401, detail="Missing authentication token")
+    fb = get_firebase_manager()
+    decoded = fb.verify_id_token(credentials.credentials)
+    if not decoded:
+        raise HTTPException(status_code=401, detail="Invalid or expired authentication token")
+    return type("User", (), {
+        "uid": decoded.get("uid", ""),
+        "sub": decoded.get("uid", ""),
+        "email": decoded.get("email", ""),
+        "name": decoded.get("name", decoded.get("email", "").split("@")[0]),
+        "user_metadata": decoded,
+    })()
+
+
+def _get_user_id(user) -> str:
+    return getattr(user, "uid", getattr(user, "sub", ""))
+
+
+# ── Pydantic models ───────────────────────────────────────────────────────────
 
 class UserCredentials(BaseModel):
     email: str
     password: str
     full_name: Optional[str] = None
 
+
+class ProfileUpdateRequest(BaseModel):
+    full_name: Optional[str] = None
+    job_title: Optional[str] = None
+    years_experience: Optional[str] = None
+    bio: Optional[str] = None
+    location: Optional[str] = None
+    target_roles: Optional[List[str]] = None
+    profile_complete: Optional[bool] = None
+
+
+class AnswerRequest(BaseModel):
+    session_id: str
+    answer: str
+
+
 class InterviewResponse(BaseModel):
     session_id: str
-    current_question: Optional[str]
-    is_complete: bool
-    current_question_idx: int
-    total_questions: int
-    score: Optional[float] = None
+    current_question: Optional[str] = None
+    is_complete: bool = False
+    current_question_idx: int = 0
+    total_questions: int = 0
+
 
 class AnalysisResponse(BaseModel):
     session_id: str
-    score: float
-    analysis: str
-    is_complete: bool
+    score: float = 0
+    analysis: str = ""
+    is_complete: bool = False
     next_question: Optional[str] = None
 
-# Initialize FastAPI app
-app = FastAPI(
-    title="AI Interview Assistant Backend API",
-    description="Backend microservice for AI-driven mock interviews",
-    version="1.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc"
-)
 
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.ALLOWED_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# ── In-memory stores ──────────────────────────────────────────────────────────
 
-# Add request logging middleware
-@app.middleware("http")
-async def log_requests(request: Request, call_next):
-    print(f"[MIDDLEWARE] {request.method} {request.url}")
-    
-    # Only log authorization header presence/absence for non-OPTIONS requests
-    if request.method != "OPTIONS":
-        auth_header = request.headers.get("authorization")
-        if auth_header:
-            print(f"[MIDDLEWARE] Authorization header present")
-        else:
-            print(f"[MIDDLEWARE] No authorization header found")
-    
-    response = await call_next(request)
-    print(f"[MIDDLEWARE] Response status: {response.status_code}")
-    return response
+_active_sessions: Dict[str, Any] = {}   # LangGraph sessions (legacy REST flow)
+_live_sessions: Dict[str, Any] = {}     # Gemini File API sessions (live WS flow)
 
-# Initialize services
-openai_api_key = os.getenv("OPENAI_API_KEY")
-if not openai_api_key:
-    raise ValueError("OPENAI_API_KEY environment variable is required")
 
-interview_system = InterviewSystem(openai_api_key)
-supabase_manager = SupabaseManager()
-security = HTTPBearer(auto_error=False)
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
-print("[STARTUP] Server initialized with security and middleware")
+async def _validate_upload(upload: UploadFile, field: str, max_bytes: int = 10 * 1024 * 1024) -> bytes:
+    content = await upload.read()
+    if len(content) > max_bytes:
+        raise HTTPException(status_code=413, detail=f"{field} exceeds 10 MB limit")
+    filename = (upload.filename or "").lower()
+    if not (filename.endswith(".pdf") or filename.endswith(".txt")):
+        raise HTTPException(status_code=400, detail=f"{field} must be a PDF or TXT file")
+    return content
 
-# Global variables (consider using dependency injection for production)
-active_sessions: Dict[str, Dict[str, Any]] = {}
 
-def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    """Get current user from JWT token"""
-    # For development: Accept dummy token and return mock user
-    if settings.ENVIRONMENT == "development" and credentials.credentials == "dummy-token":
-        # Return a mock user object for development
-        return type('User', (), {
-            'id': '176d665a-4932-4934-a03d-5519301517f5',
-            'email': 'iasolaiman@ualr.edu',
-            'name': 'iasolaiman'
-        })()
-
-    # Try to validate JWT using Supabase JWKS
-    token = credentials.credentials
-    
-    try:
-        # First try simple JWT decode without verification for debugging
-        import jwt
-        unverified_payload = jwt.decode(token, options={"verify_signature": False})
-        
-        # For now, if we can decode the JWT (even unverified), accept it
-        # This is for development - in production you'd want full verification
-        if unverified_payload.get('aud') == 'authenticated':
-            return type('User', (), unverified_payload)()
-        
-        # Try full verification
-        from jwt import PyJWKClient
-        SUPABASE_PROJECT_ID = os.getenv("SUPABASE_PROJECT_ID") or "ikaebwiruhrnsgjinojh"
-        JWKS_URL = f"https://{SUPABASE_PROJECT_ID}.supabase.co/auth/v1/keys"
-        
-        jwks_client = PyJWKClient(JWKS_URL)
-        signing_key = jwks_client.get_signing_key_from_jwt(token)
-        
-        decoded = jwt.decode(
-            token,
-            signing_key.key,
-            algorithms=["RS256"],
-            audience="authenticated",
-            options={"verify_aud": True}
-        )
-        return type('User', (), decoded)()
-        
-    except Exception as e:
-        raise HTTPException(status_code=401, detail=f"Invalid authentication token: {str(e)}")
-
-def create_interview_system(config: InterviewConfigAPI = None) -> InterviewSystem:
-    """Create and configure interview system"""
-    api_key = os.getenv("OPENAI_API_KEY")
+async def _run_resume_analysis(resume_text: str) -> dict:
+    """Run AI analysis on resume text using Gemini."""
+    api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        raise HTTPException(status_code=500, detail="OpenAI API key not configured")
-    
-    # Convert API config to core config
-    if config:
-        core_config = CoreInterviewConfig(
-            max_questions=config.max_questions,
-            chunk_size=config.chunk_size,
-            chunk_overlap=config.chunk_overlap,
-            rag_k_results=config.rag_k_results,
-            temperature=config.temperature,
-            model_name=config.model_name,
-            index_path=config.index_path
+        return {}
+    try:
+        from google import genai
+        from google.genai import types
+        client = genai.Client(api_key=api_key)
+        prompt = (
+            "Analyze this resume and return a JSON object with keys: "
+            "summary (string), skills (list of strings), experience_years (number), "
+            "education (string), strengths (list of strings). Resume:\n\n" + resume_text[:3000]
         )
-    else:
-        core_config = CoreInterviewConfig()
-    
-    return InterviewSystem(api_key, core_config)
+        response = await client.aio.models.generate_content(
+            model=settings.GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(response_mime_type="application/json"),
+        )
+        import json
+        return json.loads(response.text)
+    except Exception as e:
+        logger.error(f"Resume analysis failed: {e}")
+        return {}
 
-# Health check endpoint
+
+# ── Health ────────────────────────────────────────────────────────────────────
+
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
     return {"status": "healthy", "timestamp": datetime.now().isoformat()}
 
-# Test endpoint for development (bypasses auth)
-@app.post("/test/interview/start", response_model=InterviewResponse)
-async def test_start_interview(
-    resume: UploadFile = File(...),
-    job_description: UploadFile = File(...),
-    max_questions: int = Form(3),
-    model_name: str = Form("gpt-4.1-nano-2025-04-14")
-):
-    """Start a new interview session (test endpoint without auth)"""
-    try:
-        # Save uploaded files temporarily
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf" if resume.filename.endswith('.pdf') else ".txt") as resume_file:
-            resume_content = await resume.read()
-            resume_file.write(resume_content)
-            resume_path = resume_file.name
 
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".txt") as job_file:
-            job_content = await job_description.read()
-            job_file.write(job_content)
-            job_path = job_file.name
+# ── Auth endpoints ────────────────────────────────────────────────────────────
 
-        # Create interview system with simple config
-        config = InterviewConfigAPI(
-            max_questions=max_questions,
-            model_name=model_name
-        )
-        interview_system = create_interview_system(config)
-        
-        # Start interview
-        session_id = str(uuid.uuid4())
-        interview_state = interview_system.start_interactive_interview(resume_path, job_path)
-        
-        # Store session
-        active_sessions[session_id] = {
-            "interview_system": interview_system,
-            "interview_state": interview_state,
-            "user_id": "test_user",
-            "created_at": datetime.now().isoformat()
-        }
-        
-        # Get first question
-        question = interview_system.get_next_question(interview_state)
-        
-        return InterviewResponse(
-            session_id=session_id,
-            current_question=question,
-            is_complete=False,
-            current_question_idx=interview_state.get('current_question_idx', 0),
-            total_questions=len(interview_state.get('interview_plan', []))
-        )
-        
-    except Exception as e:
-        # Clean up temporary files
-        try:
-            os.unlink(resume_path)
-            os.unlink(job_path)
-        except:
-            pass
-        raise HTTPException(status_code=500, detail=f"Interview start failed: {e}")
-
-# Test endpoint for answer submission (bypasses auth)
-@app.post("/test/interview/answer", response_model=AnalysisResponse)
-async def test_submit_answer(request: AnswerRequest):
-    """Submit an answer to the current question (test endpoint without auth)"""
-    try:
-        if request.session_id not in active_sessions:
-            raise HTTPException(status_code=404, detail="Interview session not found")
-        
-        session = active_sessions[request.session_id]
-        interview_system = session["interview_system"]
-        interview_state = session["interview_state"]
-        
-        # Process the answer
-        updated_state = interview_system.process_candidate_answer(interview_state, request.answer)
-        session["interview_state"] = updated_state
-        
-        # Get latest score
-        latest_note = updated_state.get('interview_notes', [])[-1] if updated_state.get('interview_notes') else None
-        score = latest_note.get('score', 0) if latest_note else 0
-        analysis = latest_note.get('analysis', '') if latest_note else ''
-        
-        # Check if interview is complete
-        is_complete = updated_state.get('current_question_idx', 0) >= len(updated_state.get('interview_plan', []))
-        
-        # Get next question if not complete
-        next_question = None
-        if not is_complete:
-            next_question = interview_system.get_next_question(updated_state)
-        
-        return AnalysisResponse(
-            session_id=request.session_id,
-            score=score,
-            analysis=analysis,
-            is_complete=is_complete,
-            next_question=next_question
-        )
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to process answer: {e}")
-
-# Authentication endpoints
 @app.post("/auth/signup")
 async def signup(credentials: UserCredentials):
-    """Sign up a new user"""
-    try:
-        result = supabase_manager.sign_up(
-            credentials.email, 
-            credentials.password, 
-            credentials.full_name or ""
-        )
-        if result.get("success"):
-            return {"message": "User created successfully", "user": result.get("user")}
-        else:
-            error_message = result.get("error", "Signup failed")
-            # Return appropriate status codes based on error type
-            if "Password should contain" in error_message:
-                raise HTTPException(status_code=422, detail=error_message)
-            elif "already registered" in error_message.lower():
-                raise HTTPException(status_code=409, detail=error_message)
-            else:
-                raise HTTPException(status_code=400, detail=error_message)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+    fb = get_firebase_manager()
+    result = fb.create_user(credentials.email, credentials.password, credentials.full_name or "")
+    if not result.get("success"):
+        error = result.get("error", "Signup failed")
+        if "already" in error.lower() or "exists" in error.lower():
+            raise HTTPException(status_code=409, detail=error)
+        raise HTTPException(status_code=400, detail=error)
+    session = result.get("session", {})
+    return {
+        "message": "Account created",
+        "user": result.get("user"),
+        "session": session,
+        "needs_setup": True,
+    }
+
 
 @app.post("/auth/signin")
 async def signin(credentials: UserCredentials):
-    """Sign in an existing user"""
-    try:
-        result = supabase_manager.sign_in(credentials.email, credentials.password)
-        if result.get("success"):
-            return {
-                "message": "Signed in successfully", 
-                "user": result.get("user"),
-                "session": result.get("session")
-            }
-        else:
-            raise HTTPException(status_code=401, detail=result.get("error", "Login failed"))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    fb = get_firebase_manager()
+    result = fb.sign_in_with_email_password(credentials.email, credentials.password)
+    if not result.get("success"):
+        raise HTTPException(status_code=401, detail=result.get("error", "Sign in failed"))
+
+    uid = result["user"]["uid"]
+    profile = fb.get_user_profile(uid) or {}
+    needs_setup = profile.get("profile_complete") is False
+
+    return {
+        "message": "Signed in",
+        "user": result["user"],
+        "session": result.get("session", {}),
+        "needs_setup": needs_setup,
+    }
+
 
 @app.post("/auth/signout")
 async def signout(current_user=Depends(get_current_user)):
-    """Sign out current user"""
-    try:
-        result = supabase_manager.sign_out()
-        return {"message": "Signed out successfully"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return {"message": "Signed out"}
+
+
+@app.post("/auth/google")
+async def google_signin(credentials: HTTPAuthorizationCredentials = Depends(_security)):
+    if not credentials:
+        raise HTTPException(status_code=401, detail="Missing token")
+    fb = get_firebase_manager()
+    decoded = fb.verify_id_token(credentials.credentials)
+    if not decoded:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+    uid = decoded.get("uid", "")
+    email = decoded.get("email", "")
+    name = decoded.get("name", email.split("@")[0])
+
+    result = fb.get_or_create_user_profile(uid, email, name)
+    profile = result["data"]
+    # Only require setup for brand-new users or when profile_complete is explicitly False.
+    needs_setup = result["is_new"] or profile.get("profile_complete") is False
+
+    return {
+        "user": {"id": uid, "email": email, "name": name},
+        "needs_setup": needs_setup,
+    }
+
 
 @app.get("/auth/me")
 async def get_current_user_info(current_user=Depends(get_current_user)):
-    """Get current user information"""
-    try:
-        # Return user info from the JWT token
-        return {
-            "user": {
-                "id": getattr(current_user, 'sub', getattr(current_user, 'id', None)),
-                "email": getattr(current_user, 'email', None),
-                "name": getattr(current_user, 'name', getattr(current_user, 'user_metadata', {}).get('full_name', None))
-            }
+    return {
+        "user": {
+            "id": _get_user_id(current_user),
+            "email": getattr(current_user, "email", None),
+            "name": getattr(current_user, "name", None),
         }
-    except Exception as e:
-        raise HTTPException(status_code=401, detail="Invalid authentication token")
+    }
 
-# Interview endpoints
+
+# ── Profile ───────────────────────────────────────────────────────────────────
+
+@app.get("/profile")
+async def get_profile(current_user=Depends(get_current_user)):
+    uid = _get_user_id(current_user)
+    fb = get_firebase_manager()
+    profile = fb.get_user_profile(uid)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    profile.pop("resume_text", None)
+    return {"profile": profile}
+
+
+@app.put("/profile")
+async def update_profile(request: ProfileUpdateRequest, current_user=Depends(get_current_user)):
+    uid = _get_user_id(current_user)
+    fb = get_firebase_manager()
+    update_data = {k: v for k, v in request.dict().items() if v is not None}
+    if not fb.update_user_profile_full(uid, update_data):
+        raise HTTPException(status_code=500, detail="Failed to update profile")
+    return {"message": "Profile updated successfully"}
+
+
+@app.post("/profile/resume")
+async def upload_resume(resume: UploadFile = File(...), current_user=Depends(get_current_user)):
+    uid = _get_user_id(current_user)
+    resume_path = None
+    try:
+        resume_bytes = await _validate_upload(resume, "resume")
+        suffix = ".pdf" if (resume.filename or "").lower().endswith(".pdf") else ".txt"
+        with tempfile.NamedTemporaryFile(delete=False, dir="/tmp", suffix=suffix) as f:
+            f.write(resume_bytes)
+            resume_path = f.name
+
+        from langchain_community.document_loaders import PyPDFLoader, TextLoader
+        if resume_path.endswith(".pdf"):
+            loader = PyPDFLoader(resume_path)
+        else:
+            loader = TextLoader(resume_path, encoding="utf-8")
+        docs = loader.load()
+        resume_text = "\n".join(d.page_content for d in docs)
+
+        analysis = await _run_resume_analysis(resume_text)
+
+        fb = get_firebase_manager()
+        fb.store_resume_data(uid, resume_text, resume.filename, analysis)
+
+        return {"message": "Resume uploaded and analyzed", "analysis": analysis, "filename": resume.filename}
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback; logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Failed to process resume: {e}")
+    finally:
+        if resume_path:
+            try: os.unlink(resume_path)
+            except OSError: pass
+
+
+@app.get("/profile/resume/analysis")
+async def get_resume_analysis(current_user=Depends(get_current_user)):
+    uid = _get_user_id(current_user)
+    fb = get_firebase_manager()
+    data = fb.get_resume_data(uid)
+    if not data or not data.get("resume_analysis"):
+        raise HTTPException(status_code=404, detail="No resume analysis found. Upload a resume first.")
+    return data
+
+
+# ── Legacy REST interview (LangGraph) ─────────────────────────────────────────
+
 @app.post("/interview/start", response_model=InterviewResponse)
 async def start_interview(
     resume: UploadFile = File(...),
     job_description: UploadFile = File(...),
     max_questions: int = Form(3),
-    model_name: str = Form("gpt-4.1-nano-2025-04-14"),
+    model_name: str = Form("gemini-2.5-flash"),
     temperature: float = Form(0.3),
-    current_user=Depends(get_current_user)
+    current_user=Depends(get_current_user),
 ):
-    """Start a new interview session"""
-    user_id = getattr(current_user, 'sub', getattr(current_user, 'id', None))
-    print(f"Starting interview for user: {user_id}")
-    print(f"Config: max_questions={max_questions}, model={model_name}, temp={temperature}")
-    
-    resume_path = None
-    job_path = None
-    
+    from app.services.interview_system import InterviewSystem
+    from app.services.models import InterviewConfig
+
+    user_id = _get_user_id(current_user)
+    resume_path = job_path = None
     try:
-        # Save uploaded files temporarily
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf" if resume.filename.endswith('.pdf') else ".txt") as resume_file:
-            resume_content = await resume.read()
-            resume_file.write(resume_content)
-            resume_path = resume_file.name
+        resume_bytes = await _validate_upload(resume, "resume")
+        job_bytes = await _validate_upload(job_description, "job_description")
 
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".txt") as job_file:
-            job_content = await job_description.read()
-            job_file.write(job_content)
-            job_path = job_file.name
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf" if (resume.filename or "").endswith(".pdf") else ".txt") as f:
+            f.write(resume_bytes); resume_path = f.name
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".txt") as f:
+            f.write(job_bytes); job_path = f.name
 
-        # Create interview system
-        config = InterviewConfigAPI(
-            max_questions=max_questions,
-            model_name=model_name,
-            temperature=temperature
-        )
-        interview_system = create_interview_system(config)
-        
-        # Start interview
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            raise HTTPException(status_code=500, detail="Gemini API key not configured")
+
+        config = InterviewConfig(max_questions=max_questions, model_name=model_name, temperature=temperature)
+        system = InterviewSystem(api_key, config)
+        interview_state = system.start_interactive_interview(resume_path, job_path)
+
         session_id = str(uuid.uuid4())
-        interview_state = interview_system.start_interactive_interview(resume_path, job_path)
-        
-        # Get user ID
-        user_id = getattr(current_user, 'sub', getattr(current_user, 'id', None))
-        
-        # Prepare session data for database
-        session_data = {
+        _active_sessions[session_id] = {
+            "interview_system": system,
+            "interview_state": interview_state,
             "user_id": user_id,
-            "status": "in_progress",
-            "total_questions": len(interview_state.get('interview_plan', [])),
-            "current_question_idx": interview_state.get('current_question_idx', 0),
-            "interview_plan": interview_state.get('interview_plan', []),
-            "interview_notes": interview_state.get('interview_notes', []),
-            "conversation_history": interview_state.get('conversation_history', []),
-            "resume_content": resume.filename,
-            "job_description": job_description.filename,
-            "title": f"Interview Session {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+            "created_at": datetime.now().isoformat(),
         }
-        
-        # Save session to database FIRST with proper session_id
-        print(f"🔄 Creating session in DB with ID: {session_id}")
-        try:
-            # Use a direct insert with the specific session_id
-            db_response = supabase_manager.client.table('interview_sessions').insert({
-                "id": session_id,
-                **session_data,
-                "created_at": datetime.now().isoformat(),
-                "updated_at": datetime.now().isoformat()
-            }).execute()
-            
-            if db_response.data:
-                print(f"✅ Session created successfully in DB with ID: {session_id}")
-                
-                # Store session in memory only after DB success
-                active_sessions[session_id] = {
-                    "interview_system": interview_system,
-                    "interview_state": interview_state,
-                    "user_id": user_id,
-                    "created_at": datetime.now().isoformat()
-                }
-            else:
-                print(f"❌ Session creation failed - no data returned from DB")
-                raise HTTPException(status_code=500, detail="Failed to create session in database")
-                
-        except Exception as db_error:
-            print(f"❌ Exception during session creation: {db_error}")
-            import traceback
-            print(f"❌ Creation traceback: {traceback.format_exc()}")
-            raise HTTPException(status_code=500, detail=f"Failed to create session: {str(db_error)}")
-        
-        # Get first question
-        question = interview_system.get_next_question(interview_state)
-        
+
+        question = system.get_next_question(interview_state)
         return InterviewResponse(
             session_id=session_id,
             current_question=question,
             is_complete=False,
-            current_question_idx=interview_state.get('current_question_idx', 0),
-            total_questions=len(interview_state.get('interview_plan', []))
+            current_question_idx=interview_state.get("current_question_idx", 0),
+            total_questions=len(interview_state.get("interview_plan", [])),
         )
-        
-    except Exception as e:
-        import traceback
-        print(f"❌ Error in start_interview: {e}")
-        print(f"Traceback: {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"Failed to start interview: {str(e)}")
-        
     finally:
-        # Clean up temp files
-        try:
-            if resume_path:
-                os.unlink(resume_path)
-            if job_path:
-                os.unlink(job_path)
-        except Exception as cleanup_error:
-            print(f"⚠️ Failed to clean up temporary files: {cleanup_error}")
+        for p in [resume_path, job_path]:
+            if p:
+                try: os.unlink(p)
+                except OSError: pass
+
 
 @app.post("/interview/answer", response_model=AnalysisResponse)
-async def submit_answer(
-    request: AnswerRequest,
-    background_tasks: BackgroundTasks,
-    current_user=Depends(get_current_user)
-):
-    """Submit an answer to the current question"""
+async def submit_answer(request: AnswerRequest, current_user=Depends(get_current_user)):
+    if request.session_id not in _active_sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+    session = _active_sessions[request.session_id]
+    system = session["interview_system"]
+    state = session["interview_state"]
+
+    updated = system.process_candidate_answer(state, request.answer)
+    session["interview_state"] = updated
+
+    note = updated.get("interview_notes", [])[-1] if updated.get("interview_notes") else {}
+    score = note.get("score", 0)
+    analysis = note.get("analysis", note.get("observations", ""))
+
+    current_idx = updated.get("current_question_idx", 0)
+    total = len(updated.get("interview_plan", []))
+    is_complete = current_idx >= total
+
+    next_question = None
+    if not is_complete:
+        next_question = system.get_next_question(updated)
+
+    return AnalysisResponse(
+        session_id=request.session_id,
+        score=score,
+        analysis=analysis,
+        is_complete=is_complete,
+        next_question=next_question,
+    )
+
+
+@app.get("/interview/sessions")
+async def get_interview_sessions(current_user=Depends(get_current_user), limit: int = 50):
+    uid = _get_user_id(current_user)
+    fb = get_firebase_manager()
     try:
-        if request.session_id not in active_sessions:
-            raise HTTPException(status_code=404, detail="Interview session not found")
+        sessions = fb.get_user_interview_sessions(uid, limit) or []
+    except Exception:
+        sessions = []
+    return {"sessions": sessions}
 
-        session = active_sessions[request.session_id]
-        interview_system = session["interview_system"]
-        interview_state = session["interview_state"]
-        user_id = getattr(current_user, 'sub', getattr(current_user, 'id', None))
 
-        print(f"📝 Processing answer for session {request.session_id}")
-        print(f"📋 Current question index: {interview_state.get('current_question_idx', 0)}")
-        print(f"📋 Total questions in plan: {len(interview_state.get('interview_plan', []))}")
+@app.get("/interview/sessions/{session_id}")
+async def get_interview_session(session_id: str, current_user=Depends(get_current_user)):
+    uid = _get_user_id(current_user)
+    fb = get_firebase_manager()
+    session = fb.get_interview_session(uid, session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return session
 
-        # Process the answer
-        updated_state = interview_system.process_candidate_answer(interview_state, request.answer)
-        session["interview_state"] = updated_state
 
-        # Get latest score
-        latest_note = updated_state.get('interview_notes', [])[-1] if updated_state.get('interview_notes') else None
-        score = latest_note.get('score', 0) if latest_note else 0
-        analysis = latest_note.get('analysis', '') if latest_note else ''
+@app.get("/interview/sessions/{session_id}/report")
+async def get_interview_report(session_id: str, current_user=Depends(get_current_user)):
+    uid = _get_user_id(current_user)
+    fb = get_firebase_manager()
+    session = fb.get_interview_session(uid, session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return session
 
-        # Check if interview is complete - use the configured max_questions, not just plan length
-        current_idx = updated_state.get('current_question_idx', 0)
-        total_questions = len(updated_state.get('interview_plan', []))
-        is_complete = current_idx >= total_questions
 
-        print(f"📊 After processing: current_idx={current_idx}, total_questions={total_questions}, is_complete={is_complete}")
+# ── Resume Analyzer ───────────────────────────────────────────────────────────
 
-        # Update progress in the database
-        try:
-            progress = round((current_idx / total_questions) * 100, 2)
-            session_update_data = {
-                "current_question_idx": current_idx,
-                "progress": progress,
-                "last_activity": datetime.now()
-            }
-            print(f"🔄 Updating session progress in DB: {session_update_data}")
-            supabase_manager.update_interview_session(request.session_id, session_update_data, user_id)
-        except Exception as e:
-            print(f"⚠️ Failed to update session progress: {e}")
-
-        # Get next question if not complete
-        next_question = None
-        if not is_complete:
-            next_question = interview_system.get_next_question(updated_state)
-            print(f"❓ Next question: {next_question[:100] if next_question else 'None'}...")
-
-        # If complete, generate the report in the background
-        if is_complete:
-            def generate_report():
-                try:
-                    print("🎯 Interview complete! Generating final report...")
-                    final_state = interview_system.generate_final_report(updated_state)
-                    session["interview_state"] = final_state
-
-                    # Calculate overall score
-                    all_scores = [note.get('score', 0) for note in final_state.get('interview_notes', []) if note.get('score') is not None]
-                    overall_score = sum(all_scores) / len(all_scores) if all_scores else 0
-                    session["overall_score"] = overall_score
-
-                    # Save final session to database
-                    final_session_data = {
-                        "status": "completed",
-                        "current_question_idx": current_idx,
-                        "total_questions": total_questions,
-                        "average_score": overall_score,
-                        "final_report": final_state.get('interview_report', ''),
-                        "interview_notes": final_state.get('interview_notes', []),
-                        "conversation_history": final_state.get('conversation_history', [])
-                    }
-
-                    print(f"💾 Saving completed session to DB...")
-                    supabase_manager.update_interview_session(request.session_id, final_session_data, user_id)
-
-                    # Save report to database
-                    report_data = {
-                        "user_id": user_id,
-                        "session_id": request.session_id,
-                        "title": f"Interview Report - {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-                        "report_content": final_state.get('interview_report', ''),
-                        "summary": {"overall_score": overall_score, "total_questions": total_questions},
-                        "scores": {"individual_scores": all_scores, "average": overall_score}
-                    }
-
-                    print(f"🔄 Attempting to save report to DB for completed interview...")
-                    supabase_manager.save_interview_report(user_id, request.session_id, report_data)
-                except Exception as report_error:
-                    print(f"⚠️ Error generating final report: {report_error}")
-
-            background_tasks.add_task(generate_report)
-
-        return AnalysisResponse(
-            session_id=request.session_id,  # Include session_id in the response
-            next_question=next_question,
-            score=score,
-            analysis=analysis,
-            is_complete=is_complete
-        )
-    except Exception as e:
-        print(f"❌ Error in submit_answer: {e}")
-        import traceback
-        print(f"❌ Traceback: {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"Failed to process answer: {e}")
-
-@app.get("/interview/{session_id}/report")
-async def get_interview_report(
-    session_id: str,
-    current_user=Depends(get_current_user)
-):
-    """Retrieve interview report: generate if active, otherwise fetch latest from DB"""
-    user_id = getattr(current_user, 'sub', getattr(current_user, 'id', None))
-
-    # Active session path: generate fresh report and save
-    if session_id in active_sessions:
-        session = active_sessions[session_id]
-        interview_system = session["interview_system"]
-        interview_state = session["interview_state"]
-        final_state = interview_system.generate_final_report(interview_state)
-
-        report_data = {
-            "user_id": user_id,
-            "session_id": session_id,
-            "title": f"Interview Report - {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-            "report_content": final_state.get("interview_report", ""),
-        }
-        print(f"🔄 Attempting to save report to DB for user: {user_id}, session: {session_id}")
-        report_id = supabase_manager.save_interview_report(user_id, session_id, report_data)
-        if report_id:
-            print(f"✅ Report saved successfully to DB with ID: {report_id}")
-        return {
-            "report_id": report_id,
-            "content": final_state.get("interview_report", ""),
-            "session_id": session_id
-        }
-
-    # Inactive session path: fetch existing report
+@app.post("/analyze/resume")
+async def analyze_resume(resume: UploadFile = File(...), current_user=Depends(get_current_user)):
+    resume_path = None
     try:
-        resp = (
-            supabase_manager.client
-            .table("interview_reports")
-            .select("id, report_content")
-            .eq("session_id", session_id)
-            .eq("user_id", user_id)
-            .order("created_at", desc=True)
-            .limit(1)
-            .execute()
-        )
-        if resp.data:
-            rep = resp.data[0]
-            return {"report_id": rep["id"], "content": rep["report_content"], "session_id": session_id}
-        raise HTTPException(status_code=404, detail="Report not found")
+        resume_bytes = await _validate_upload(resume, "resume")
+        suffix = ".pdf" if (resume.filename or "").lower().endswith(".pdf") else ".txt"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
+            f.write(resume_bytes); resume_path = f.name
+
+        from langchain_community.document_loaders import PyPDFLoader, TextLoader
+        loader = PyPDFLoader(resume_path) if resume_path.endswith(".pdf") else TextLoader(resume_path, encoding="utf-8")
+        docs = loader.load()
+        resume_text = "\n".join(d.page_content for d in docs)
+        analysis = await _run_resume_analysis(resume_text)
+        return {"analysis": analysis}
     except HTTPException:
         raise
     except Exception as e:
-        print(f"⚠️ Failed to fetch report from DB: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to fetch report: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if resume_path:
+            try: os.unlink(resume_path)
+            except OSError: pass
 
-@app.get("/interview/sessions")
-async def get_user_sessions(
+
+# ── Live Interview — Gemini File API + streaming chat ─────────────────────────
+
+@app.post("/interview/prepare")
+async def prepare_live_interview(
+    resume: UploadFile = File(...),
+    job_description: UploadFile = File(...),
+    interview_type: str = Form("Job Interview"),
+    max_questions: int = Form(5),
     current_user=Depends(get_current_user),
-    limit: int = 50
 ):
-    """Get user's interview sessions"""
-    try:
-        user_id = getattr(current_user, 'sub', getattr(current_user, 'id', None))
-        print(f"🔍 Fetching sessions for user: {user_id}")
-        
-        sessions = supabase_manager.get_user_interview_sessions(user_id, limit)
-        print(f"🔍 Raw sessions from DB: {type(sessions)} - {sessions}")
-        
-        # Ensure we always return an array, even if empty or None
-        if not isinstance(sessions, list):
-            print(f"⚠️ Sessions is not a list, type: {type(sessions)}, converting to empty array")
-            sessions = []
-        
-        response = {"sessions": sessions}
-        print(f"🔍 Final response: {response}")
-        return response
-    except Exception as e:
-        print(f"❌ Error fetching sessions: {e}")
-        import traceback
-        print(f"❌ Traceback: {traceback.format_exc()}")
-        # Return empty array on error to prevent frontend crashes
-        return {"sessions": []}
+    from app.services.gemini_file_service import GeminiFileService
 
-@app.get("/reports")
-async def get_user_reports(
-    current_user=Depends(get_current_user),
-    limit: int = 50
-):
-    """Get user's interview reports"""
-    try:
-        user_id = getattr(current_user, 'sub', getattr(current_user, 'id', None))
-        reports = supabase_manager.get_user_reports(user_id, limit)
-        
-        # Ensure we always return an array, even if empty or None
-        if not isinstance(reports, list):
-            reports = []
-            
-        return {"reports": reports}
-    except Exception as e:
-        print(f"❌ Error fetching reports: {e}")
-        # Return empty array on error to prevent frontend crashes
-        return {"reports": []}
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="Gemini API key not configured")
 
-@app.get("/dashboard/stats")
-async def get_dashboard_stats(current_user=Depends(get_current_user)):
-    """Get user dashboard statistics"""
-    try:
-        user_id = getattr(current_user, 'sub', getattr(current_user, 'id', None))
-        stats = supabase_manager.get_user_dashboard_stats(user_id)
-        
-        # Ensure we always return a valid stats object
-        if not isinstance(stats, dict):
-            stats = {
-                "total_interviews": 0,
-                "completed_interviews": 0,
-                "average_score": 0
-            }
-            
-        return stats
-    except Exception as e:
-        print(f"❌ Error fetching dashboard stats: {e}")
-        # Return default stats on error
-        return {
-            "total_interviews": 0,
-            "completed_interviews": 0,
-            "average_score": 0,
-            "total_reports": 0
-        }
+    uid = _get_user_id(current_user)
+    session_id = str(uuid.uuid4())
+    svc = GeminiFileService(api_key=api_key, model=settings.GEMINI_MODEL)
 
-# Admin endpoints (optional)
-@app.get("/admin/health")
-async def admin_health():
-    """Admin health check with database connection test"""
+    resume_bytes = await _validate_upload(resume, "resume")
+    jd_bytes = await _validate_upload(job_description, "job_description")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        resume_path = os.path.join(tmp, resume.filename or "resume.pdf")
+        jd_path = os.path.join(tmp, job_description.filename or "job_description.txt")
+        with open(resume_path, "wb") as f: f.write(resume_bytes)
+        with open(jd_path, "wb") as f: f.write(jd_bytes)
+
+        resume_file = await svc.upload_file(resume_path, f"resume_{session_id}")
+        jd_file = await svc.upload_file(jd_path, f"jd_{session_id}")
+
+    question_plan = await svc.generate_question_plan(
+        resume_file=resume_file,
+        jd_file=jd_file,
+        num_questions=max_questions,
+        interview_type=interview_type,
+    )
+
+    _live_sessions[session_id] = {
+        "user_id": uid,
+        "interview_type": interview_type,
+        "question_plan": question_plan,
+        "resume_file_uri": resume_file.uri,
+        "resume_mime_type": resume_file.mime_type or "application/pdf",
+        "jd_file_uri": jd_file.uri,
+        "jd_mime_type": jd_file.mime_type or "text/plain",
+        "resume_file_name": resume_file.name,
+        "jd_file_name": jd_file.name,
+        "created_at": datetime.now().isoformat(),
+    }
+
+    return {
+        "session_id": session_id,
+        "question_count": len(question_plan),
+        "interview_type": interview_type,
+        "questions_preview": [q["question"] for q in question_plan],
+    }
+
+
+@app.websocket("/ws/interview/{session_id}")
+async def live_interview_websocket(websocket: WebSocket, session_id: str):
+    from app.services.live_interview_agent import LiveInterviewAgent
+    from app.services.gemini_file_service import GeminiFileService
+
+    await websocket.accept()
+
+    # Auth
     try:
-        db_status = supabase_manager.test_connection()
-        return {
-            "api_status": "healthy",
-            "database_status": db_status,
-            "timestamp": datetime.now().isoformat()
-        }
-    except Exception as e:
-        return {
-            "api_status": "healthy",
-            "database_status": {"success": False, "error": str(e)},
-            "timestamp": datetime.now().isoformat()
-        }
+        auth_msg = await asyncio.wait_for(websocket.receive_json(), timeout=15)
+        token = auth_msg.get("token", "")
+        fb = get_firebase_manager()
+        decoded = fb.verify_id_token(token)
+        if not decoded:
+            await websocket.send_json({"type": "error", "message": "Invalid token"})
+            await websocket.close()
+            return
+        uid = decoded.get("uid") or decoded.get("user_id")
+    except Exception as exc:
+        await websocket.send_json({"type": "error", "message": f"Auth failed: {exc}"})
+        await websocket.close()
+        return
+
+    # Load session
+    session = _live_sessions.get(session_id)
+    if not session:
+        await websocket.send_json({"type": "error", "message": "Session not found. Call /interview/prepare first."})
+        await websocket.close()
+        return
+
+    if session["user_id"] != uid:
+        await websocket.send_json({"type": "error", "message": "Unauthorised session"})
+        await websocket.close()
+        return
+
+    await websocket.send_json({"type": "authenticated"})
+    await websocket.send_json({
+        "type": "ready",
+        "session_id": session_id,
+        "question_count": len(session["question_plan"]),
+        "interview_type": session["interview_type"],
+    })
+
+    api_key = os.getenv("GEMINI_API_KEY")
+
+    agent = LiveInterviewAgent(api_key=api_key)
+    transcript = await agent.run(
+        websocket=websocket,
+        session_id=session_id,
+        question_plan=session["question_plan"],
+        interview_type=session["interview_type"],
+        resume_file_uri=session["resume_file_uri"],
+        resume_mime_type=session["resume_mime_type"],
+        jd_file_uri=session["jd_file_uri"],
+        jd_mime_type=session["jd_mime_type"],
+    )
+
+    if not transcript:
+        logger.warning("Interview ended with empty transcript — skipping analysis.")
+        _live_sessions.pop(session_id, None)
+        return
+
+    # Post-interview: analyze + save
+    try:
+        svc = GeminiFileService(api_key=api_key, model=settings.GEMINI_MODEL)
+
+        class _FakeFile:
+            def __init__(self, uri, mime):
+                self.uri = uri
+                self.mime_type = mime
+
+        report_data = await svc.analyze_transcript(
+            transcript=transcript,
+            resume_file=_FakeFile(session["resume_file_uri"], session["resume_mime_type"]),
+            jd_file=_FakeFile(session["jd_file_uri"], session["jd_mime_type"]),
+        )
+
+        fb = get_firebase_manager()
+        fb.create_interview_session(
+            user_id=uid,
+            session_id=session_id,
+            session_data={
+                "title": f"{session['interview_type']} — {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+                "status": "completed",
+                "interview_plan": session["question_plan"],
+                "conversation_history": transcript,
+                "total_questions": len(session["question_plan"]),
+                "average_score": report_data.get("overall_score", 0),
+                "final_report": report_data.get("summary", ""),
+                "report_data": report_data,
+                "interview_type": session["interview_type"],
+            },
+        )
+
+        await websocket.send_json({"type": "report_ready", "session_id": session_id})
+
+    except Exception as exc:
+        logger.error(f"Post-interview analysis failed: {exc}")
+
+    finally:
+        _live_sessions.pop(session_id, None)
+
 
 if __name__ == "__main__":
-    
     uvicorn.run(
         "app.server:app",
         host=settings.HOST,
         port=settings.PORT,
         reload=settings.DEBUG,
-        log_level="info"
+        log_level="info",
     )

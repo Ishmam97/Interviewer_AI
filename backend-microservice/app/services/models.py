@@ -42,5 +42,5 @@ class InterviewConfig:
     chunk_overlap: int = 150
     rag_k_results: int = 3
     temperature: float = 0.3
-    model_name: str = "gpt-4.1-nano-2025-04-14"
+    model_name: str = "gemini-2.5-flash"
     index_path: str = "./interview_faiss_index"

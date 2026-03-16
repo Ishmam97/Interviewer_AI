@@ -1,15 +1,15 @@
 from datetime import datetime
 from typing import Dict, Any, List
-from langchain_openai import ChatOpenAI
-from langchain.prompts import ChatPromptTemplate
-from langchain.schema.output_parser import StrOutputParser
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
 from app.utils.prompts import ANALYSIS_PROMPT
 
 
 class ResponseAnalyzer:
     """Handles analysis of candidate responses"""
     
-    def __init__(self, llm: ChatOpenAI):
+    def __init__(self, llm: ChatGoogleGenerativeAI):
         self.llm = llm
         self.analysis_prompt = ChatPromptTemplate.from_template(ANALYSIS_PROMPT)
         self.chain = self.analysis_prompt | self.llm | StrOutputParser()

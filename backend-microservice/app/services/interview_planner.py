@@ -1,15 +1,15 @@
 import json
 from typing import List, Dict, Any
-from langchain_openai import ChatOpenAI
-from langchain.prompts import ChatPromptTemplate
-from langchain.schema.output_parser import StrOutputParser
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
 from app.utils.prompts import PLANNING_PROMPT
 
 
 class InterviewPlanner:
     """Handles interview planning and question generation"""
     
-    def __init__(self, llm: ChatOpenAI, config=None):
+    def __init__(self, llm: ChatGoogleGenerativeAI, config=None):
         self.llm = llm
         self.config = config  # Store config reference
         self.planning_prompt = ChatPromptTemplate.from_template(PLANNING_PROMPT)

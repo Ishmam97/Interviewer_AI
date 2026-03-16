@@ -1,0 +1,41 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper: caller must be the authenticated owner of the document
+    function isOwner(uid) {
+      return request.auth != null && request.auth.uid == uid;
+    }
+
+    // User profiles — owner only
+    match /profiles/{uid} {
+      allow read, write: if isOwner(uid);
+    }
+
+    // User settings — owner only
+    match /user_settings/{uid} {
+      allow read, write: if isOwner(uid);
+    }
+
+    // Interview sessions — owner only
+    match /interview_sessions/{sessionId} {
+      allow read, write: if request.auth != null
+        && resource.data.user_id == request.auth.uid;
+      allow create: if request.auth != null
+        && request.resource.data.user_id == request.auth.uid;
+    }
+
+    // Interview reports — owner only
+    match /interview_reports/{reportId} {
+      allow read, write: if request.auth != null
+        && resource.data.user_id == request.auth.uid;
+      allow create: if request.auth != null
+        && request.resource.data.user_id == request.auth.uid;
+    }
+
+    // Deny everything else
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

@@ -1,14 +1,14 @@
 from typing import List, Dict, Any
-from langchain_openai import ChatOpenAI
-from langchain.prompts import ChatPromptTemplate
-from langchain.schema.output_parser import StrOutputParser
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
 from app.utils.prompts import REPORT_PROMPT
 
 
 class ReportGenerator:
     """Handles generation of comprehensive interview reports"""
     
-    def __init__(self, llm: ChatOpenAI):
+    def __init__(self, llm: ChatGoogleGenerativeAI):
         self.llm = llm
         self.report_prompt = ChatPromptTemplate.from_template(REPORT_PROMPT)
         self.chain = self.report_prompt | self.llm | StrOutputParser()
