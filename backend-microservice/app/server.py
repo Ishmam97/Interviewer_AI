@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional
 
 import uvicorn
 from fastapi import (
-    Depends, File, Form, FastAPI, HTTPException, Request,
+    BackgroundTasks, Depends, File, Form, FastAPI, HTTPException, Request,
     UploadFile, WebSocket, WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware
@@ -106,9 +106,22 @@ class ProfileUpdateRequest(BaseModel):
     profile_complete: Optional[bool] = None
 
 
+class SettingsUpdateRequest(BaseModel):
+    max_questions: Optional[int] = None
+    model_name: Optional[str] = None
+    temperature: Optional[float] = None
+    api_provider: Optional[str] = None   # "openai", "gemini", "anthropic"
+    user_api_key: Optional[str] = None   # empty string = use system key
+    base_url: Optional[str] = None       # custom base URL (e.g. for AIML API)
+
+
 class AnswerRequest(BaseModel):
     session_id: str
     answer: str
+
+
+class SuggestionActionRequest(BaseModel):
+    action: str  # "accept" or "reject"
 
 
 class InterviewResponse(BaseModel):
@@ -183,7 +196,7 @@ async def health_check():
 @app.post("/auth/signup")
 async def signup(credentials: UserCredentials):
     fb = get_firebase_manager()
-    result = fb.create_user(credentials.email, credentials.password, credentials.full_name or "")
+    result = fb.sign_up(credentials.email, credentials.password, credentials.full_name or "")
     if not result.get("success"):
         error = result.get("error", "Signup failed")
         if "already" in error.lower() or "exists" in error.lower():
@@ -201,7 +214,7 @@ async def signup(credentials: UserCredentials):
 @app.post("/auth/signin")
 async def signin(credentials: UserCredentials):
     fb = get_firebase_manager()
-    result = fb.sign_in_with_email_password(credentials.email, credentials.password)
+    result = fb.sign_in(credentials.email, credentials.password)
     if not result.get("success"):
         raise HTTPException(status_code=401, detail=result.get("error", "Sign in failed"))
 
@@ -280,8 +293,40 @@ async def update_profile(request: ProfileUpdateRequest, current_user=Depends(get
     return {"message": "Profile updated successfully"}
 
 
+async def _run_resume_analysis_bg(uid: str, resume_text: str, filename: str, analysis_id: str):
+    """Background task: run full resume analysis and persist to Firestore."""
+    from app.services.resume_analyzer_service import ResumeAnalyzerService
+    fb = get_firebase_manager()
+    try:
+        svc = ResumeAnalyzerService(api_key=settings.OPENAI_API_KEY)
+        analysis = await svc.analyze(resume_text, filename, analysis_id=analysis_id, fb=fb)
+
+        fb.update_resume_analysis(analysis_id, {
+            "status": "completed",
+            "current_step": "completed",
+            "overall": analysis["overall"],
+            "sections": analysis["sections"],
+            "ats": analysis["ats"],
+            "lackings": analysis.get("lackings", []),
+            "quality_score": analysis.get("quality_score", 0),
+        })
+        fb.save_resume_parsed_sections(uid, analysis_id, filename, analysis.get("parsed_sections", {}))
+        fb.save_token_usage(uid, "resume_analysis", analysis_id, analysis.get("usage", {}))
+        fb.store_resume_data(uid, resume_text, filename, analysis_id, analysis)
+    except Exception as e:
+        logger.error(f"Background resume analysis failed: {e}")
+        fb.update_resume_analysis(analysis_id, {
+            "status": "failed",
+            "current_step": "failed",
+        })
+
+
 @app.post("/profile/resume")
-async def upload_resume(resume: UploadFile = File(...), current_user=Depends(get_current_user)):
+async def upload_resume(
+    background_tasks: BackgroundTasks,
+    resume: UploadFile = File(...),
+    current_user=Depends(get_current_user),
+):
     uid = _get_user_id(current_user)
     resume_path = None
     try:
@@ -299,12 +344,13 @@ async def upload_resume(resume: UploadFile = File(...), current_user=Depends(get
         docs = loader.load()
         resume_text = "\n".join(d.page_content for d in docs)
 
-        analysis = await _run_resume_analysis(resume_text)
-
+        analysis_id = str(uuid.uuid4())
         fb = get_firebase_manager()
-        fb.store_resume_data(uid, resume_text, resume.filename, analysis)
+        fb.create_resume_analysis(uid, analysis_id, resume.filename)
 
-        return {"message": "Resume uploaded and analyzed", "analysis": analysis, "filename": resume.filename}
+        background_tasks.add_task(_run_resume_analysis_bg, uid, resume_text, resume.filename, analysis_id)
+
+        return {"analysis_id": analysis_id, "status": "processing", "message": "Resume analysis started"}
     except HTTPException:
         raise
     except Exception as e:
@@ -326,6 +372,103 @@ async def get_resume_analysis(current_user=Depends(get_current_user)):
     return data
 
 
+@app.get("/resume/analysis/{analysis_id}/status")
+async def get_analysis_status(analysis_id: str, current_user=Depends(get_current_user)):
+    uid = _get_user_id(current_user)
+    fb = get_firebase_manager()
+    doc = fb.get_resume_analysis_by_id(analysis_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Analysis not found")
+    if doc.get("user_id") != uid:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    response = {
+        "analysis_id": analysis_id,
+        "status": doc.get("status"),
+        "current_step": doc.get("current_step"),
+        "filename": doc.get("filename"),
+    }
+    if doc.get("status") == "completed":
+        response["analysis"] = {
+            "overall": doc.get("overall"),
+            "sections": doc.get("sections"),
+            "ats": doc.get("ats"),
+            "lackings": doc.get("lackings", []),
+            "quality_score": doc.get("quality_score", 0),
+        }
+    return response
+
+
+@app.post("/profile/resume/suggestions/{suggestion_id}")
+async def update_suggestion(
+    suggestion_id: str,
+    request: SuggestionActionRequest,
+    current_user=Depends(get_current_user),
+):
+    if request.action not in ("accept", "reject"):
+        raise HTTPException(status_code=400, detail="action must be 'accept' or 'reject'")
+    uid = _get_user_id(current_user)
+    fb = get_firebase_manager()
+
+    profile_data = fb.get_resume_data(uid)
+    if not profile_data:
+        raise HTTPException(status_code=404, detail="No resume data found.")
+    analysis_id = profile_data.get("current_analysis_id")
+    if not analysis_id:
+        raise HTTPException(status_code=404, detail="No resume analysis found.")
+
+    analysis = fb.get_resume_analysis_by_id(analysis_id)
+    if not analysis or analysis.get("status") != "completed":
+        raise HTTPException(status_code=404, detail="Completed resume analysis not found.")
+
+    new_status = "accepted" if request.action == "accept" else "rejected"
+    updated = False
+
+    for s in analysis.get("overall", {}).get("suggestions", []):
+        if s.get("id") == suggestion_id:
+            s["status"] = new_status
+            updated = True
+
+    for section in analysis.get("sections", []):
+        for s in section.get("suggestions", []):
+            if s.get("id") == suggestion_id:
+                s["status"] = new_status
+                updated = True
+
+    if not updated:
+        raise HTTPException(status_code=404, detail="Suggestion not found.")
+
+    fb.update_resume_analysis(analysis_id, {
+        "overall": analysis.get("overall", {}),
+        "sections": analysis.get("sections", []),
+    })
+    return {"message": "Suggestion updated", "suggestion_id": suggestion_id, "status": new_status}
+
+
+# ── User Settings ─────────────────────────────────────────────────────────────
+
+@app.get("/settings")
+async def get_settings(current_user=Depends(get_current_user)):
+    uid = _get_user_id(current_user)
+    fb = get_firebase_manager()
+    s = fb.get_user_settings(uid) or {}
+    # Never expose the raw key — mask it for the client
+    raw_key = s.get("user_api_key", "")
+    s["user_api_key_set"] = bool(raw_key)
+    s.pop("user_api_key", None)
+    return {"settings": s}
+
+
+@app.put("/settings")
+async def update_settings(request: SettingsUpdateRequest, current_user=Depends(get_current_user)):
+    uid = _get_user_id(current_user)
+    fb = get_firebase_manager()
+    update_data = {k: v for k, v in request.dict().items() if v is not None}
+    if not fb.update_user_settings(uid, update_data):
+        raise HTTPException(status_code=500, detail="Failed to update settings")
+    return {"message": "Settings updated successfully"}
+
+
 # ── Legacy REST interview (LangGraph) ─────────────────────────────────────────
 
 @app.post("/interview/start", response_model=InterviewResponse)
@@ -341,6 +484,32 @@ async def start_interview(
     from app.services.models import InterviewConfig
 
     user_id = _get_user_id(current_user)
+
+    # Resolve which API key / provider to use
+    fb = get_firebase_manager()
+    user_settings = fb.get_user_settings(user_id) or {}
+
+    system_api_key = settings.OPENAI_API_KEY
+    system_base_url = settings.OPENAI_BASE_URL or None
+
+    user_api_key = user_settings.get("user_api_key", "")
+    provider = user_settings.get("api_provider", "openai")
+    user_base_url = user_settings.get("base_url", "") or None
+
+    if user_api_key:
+        resolved_key = user_api_key
+        resolved_base_url = user_base_url
+    else:
+        # Fall back to system AIML/OpenAI key
+        resolved_key = system_api_key
+        resolved_base_url = system_base_url
+        provider = "openai"
+
+    if not resolved_key:
+        raise HTTPException(status_code=500, detail="No API key configured. Add your key in Settings.")
+
+    effective_model = model_name or user_settings.get("model_name", settings.DEFAULT_MODEL)
+
     resume_path = job_path = None
     try:
         resume_bytes = await _validate_upload(resume, "resume")
@@ -351,12 +520,15 @@ async def start_interview(
         with tempfile.NamedTemporaryFile(delete=False, suffix=".txt") as f:
             f.write(job_bytes); job_path = f.name
 
-        api_key = os.getenv("GEMINI_API_KEY")
-        if not api_key:
-            raise HTTPException(status_code=500, detail="Gemini API key not configured")
-
-        config = InterviewConfig(max_questions=max_questions, model_name=model_name, temperature=temperature)
-        system = InterviewSystem(api_key, config)
+        config = InterviewConfig(max_questions=max_questions, model_name=effective_model, temperature=temperature)
+        system = InterviewSystem(
+            api_key=resolved_key,
+            config=config,
+            provider=provider,
+            base_url=resolved_base_url,
+            system_api_key=system_api_key,
+            system_base_url=system_base_url,
+        )
         interview_state = system.start_interactive_interview(resume_path, job_path)
 
         session_id = str(uuid.uuid4())
@@ -429,7 +601,7 @@ async def get_interview_sessions(current_user=Depends(get_current_user), limit: 
 async def get_interview_session(session_id: str, current_user=Depends(get_current_user)):
     uid = _get_user_id(current_user)
     fb = get_firebase_manager()
-    session = fb.get_interview_session(uid, session_id)
+    session = fb.get_interview_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     return session
@@ -439,7 +611,7 @@ async def get_interview_session(session_id: str, current_user=Depends(get_curren
 async def get_interview_report(session_id: str, current_user=Depends(get_current_user)):
     uid = _get_user_id(current_user)
     fb = get_firebase_manager()
-    session = fb.get_interview_session(uid, session_id)
+    session = fb.get_interview_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     return session
