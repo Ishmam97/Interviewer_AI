@@ -101,6 +101,9 @@ class FirebaseManager:
                     "temperature": 0.3,
                     "chunk_size": 500,
                     "chunk_overlap": 50,
+                    "api_provider": "openai",
+                    "user_api_key": "",
+                    "base_url": "",
                     "created_at": datetime.now().isoformat(),
                     "updated_at": datetime.now().isoformat(),
                 }
@@ -194,7 +197,7 @@ class FirebaseManager:
     def verify_id_token(self, id_token: str) -> Optional[Dict[str, Any]]:
         """Verify a Firebase ID token and return decoded claims."""
         try:
-            decoded = auth.verify_id_token(id_token)
+            decoded = auth.verify_id_token(id_token, clock_skew_seconds=10)
             return decoded
         except auth.ExpiredIdTokenError:
             logger.warning("Firebase ID token has expired")
@@ -267,6 +270,9 @@ class FirebaseManager:
                     "temperature": 0.3,
                     "chunk_size": 500,
                     "chunk_overlap": 50,
+                    "api_provider": "openai",
+                    "user_api_key": "",
+                    "base_url": "",
                     "created_at": datetime.now().isoformat(),
                     "updated_at": datetime.now().isoformat(),
                 }
@@ -282,6 +288,9 @@ class FirebaseManager:
                 "temperature": 0.3,
                 "chunk_size": 500,
                 "chunk_overlap": 50,
+                "api_provider": "openai",
+                "user_api_key": "",
+                "base_url": "",
             }
 
     def update_user_settings(
@@ -769,6 +778,9 @@ class FirebaseManager:
                     "temperature": 0.3,
                     "chunk_size": 500,
                     "chunk_overlap": 50,
+                    "api_provider": "openai",
+                    "user_api_key": "",
+                    "base_url": "",
                     "created_at": datetime.now().isoformat(),
                     "updated_at": datetime.now().isoformat(),
                 })
@@ -796,15 +808,21 @@ class FirebaseManager:
             return False
 
     def store_resume_data(
-        self, user_id: str, resume_text: str, filename: str, analysis: dict
+        self, user_id: str, resume_text: str, filename: str, analysis_id: str, analysis: dict
     ) -> bool:
-        """Store resume text and analysis in the user's profile document."""
+        """Store a lightweight resume summary in the user's profile document."""
         try:
+            parsed = analysis.get("parsed_sections", {})
+            resume_summary = {
+                "name": parsed.get("name", ""),
+                "contact": parsed.get("contact", {}),
+                "skills": parsed.get("skills", [])[:10],
+            }
             self.db.collection("profiles").document(user_id).set(
                 {
-                    "resume_text": resume_text,
                     "resume_filename": filename,
-                    "resume_analysis": analysis,
+                    "current_analysis_id": analysis_id,
+                    "resume_summary": resume_summary,
                     "resume_updated_at": datetime.now().isoformat(),
                     "updated_at": datetime.now().isoformat(),
                 },
@@ -816,21 +834,133 @@ class FirebaseManager:
             return False
 
     def get_resume_data(self, user_id: str) -> Optional[Dict[str, Any]]:
-        """Return stored resume text and analysis for a user."""
+        """Return resume analysis for a user, fetching from resume_analyses collection."""
         try:
             doc = self.db.collection("profiles").document(user_id).get()
-            if doc.exists:
-                data = doc.to_dict()
-                return {
-                    "resume_text": data.get("resume_text", ""),
-                    "resume_filename": data.get("resume_filename", ""),
-                    "resume_analysis": data.get("resume_analysis"),
-                    "resume_updated_at": data.get("resume_updated_at"),
-                }
-            return None
+            if not doc.exists:
+                return None
+            profile = doc.to_dict()
+            analysis_id = profile.get("current_analysis_id")
+            analysis = self.get_resume_analysis_by_id(analysis_id) if analysis_id else None
+
+            if analysis and analysis_id:
+                parsed_doc = self.db.collection("resume_parsed_sections").document(analysis_id).get()
+                if parsed_doc.exists:
+                    parsed_data = parsed_doc.to_dict()
+                    analysis["parsed_sections"] = parsed_data.get("parsed_sections", {})
+
+            return {
+                "resume_filename": profile.get("resume_filename", ""),
+                "resume_analysis": analysis,
+                "resume_summary": profile.get("resume_summary", {}),
+                "current_analysis_id": analysis_id,
+                "resume_updated_at": profile.get("resume_updated_at"),
+            }
         except Exception as e:
             logger.error(f"Error fetching resume data: {e}")
             return None
+
+    # ──────────────────────────────────────────────
+    # Resume Analyses
+    # ──────────────────────────────────────────────
+
+    def create_resume_analysis(self, user_id: str, analysis_id: str, filename: str) -> bool:
+        """Create a new resume_analyses doc with status=processing."""
+        try:
+            self.db.collection("resume_analyses").document(analysis_id).set({
+                "user_id": user_id,
+                "analysis_id": analysis_id,
+                "filename": filename,
+                "status": "processing",
+                "current_step": "parsing_document",
+                "overall": {},
+                "sections": [],
+                "ats": {},
+                "lackings": [],
+                "quality_score": 0,
+                "created_at": datetime.now().isoformat(),
+                "updated_at": datetime.now().isoformat(),
+            })
+            return True
+        except Exception as e:
+            logger.error(f"Error creating resume analysis: {e}")
+            return False
+
+    def update_resume_analysis(self, analysis_id: str, data: dict) -> bool:
+        """Update fields on an existing resume_analyses doc."""
+        try:
+            data["updated_at"] = datetime.now().isoformat()
+            self.db.collection("resume_analyses").document(analysis_id).update(data)
+            return True
+        except Exception as e:
+            logger.error(f"Error updating resume analysis {analysis_id}: {e}")
+            return False
+
+    def get_resume_analysis_by_id(self, analysis_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch a single resume_analyses doc by ID."""
+        try:
+            doc = self.db.collection("resume_analyses").document(analysis_id).get()
+            if doc.exists:
+                data = doc.to_dict()
+                data["id"] = doc.id
+                return data
+            return None
+        except Exception as e:
+            logger.error(f"Error fetching resume analysis {analysis_id}: {e}")
+            return None
+
+    def get_latest_resume_analysis(self, user_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch the most recent resume_analyses doc for a user."""
+        try:
+            docs = (
+                self.db.collection("resume_analyses")
+                .where(filter=FieldFilter("user_id", "==", user_id))
+                .order_by("created_at", direction=firestore.Query.DESCENDING)
+                .limit(1)
+                .stream()
+            )
+            for doc in docs:
+                data = doc.to_dict()
+                data["id"] = doc.id
+                return data
+            return None
+        except Exception as e:
+            logger.error(f"Error fetching latest resume analysis for {user_id}: {e}")
+            return None
+
+    def save_resume_parsed_sections(
+        self, user_id: str, analysis_id: str, filename: str, parsed_sections: dict
+    ) -> bool:
+        """Create/overwrite resume_parsed_sections/{analysis_id}."""
+        try:
+            self.db.collection("resume_parsed_sections").document(analysis_id).set({
+                "user_id": user_id,
+                "analysis_id": analysis_id,
+                "filename": filename,
+                "parsed_sections": parsed_sections,
+                "created_at": datetime.now().isoformat(),
+            })
+            return True
+        except Exception as e:
+            logger.error(f"Error saving parsed sections for {analysis_id}: {e}")
+            return False
+
+    def save_token_usage(
+        self, user_id: str, feature: str, analysis_id: str, usage: dict
+    ) -> bool:
+        """Add a doc to the token_usage admin collection."""
+        try:
+            self.db.collection("token_usage").add({
+                "user_id": user_id,
+                "feature": feature,
+                "analysis_id": analysis_id,
+                "usage": usage,
+                "created_at": datetime.now().isoformat(),
+            })
+            return True
+        except Exception as e:
+            logger.error(f"Error saving token usage for {analysis_id}: {e}")
+            return False
 
     # ──────────────────────────────────────────────
     # Connection Test
