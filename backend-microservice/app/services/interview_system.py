@@ -1,5 +1,4 @@
 from typing import Dict, Optional
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 
 from app.services.models import InterviewState, InterviewConfig
 from app.services.document_processor import DocumentProcessor
@@ -10,21 +9,88 @@ from app.services.report_generator import ReportGenerator
 from app.services.workflow_manager import InterviewWorkflowManager
 
 
+def _build_llm_and_embeddings(
+    provider: str,
+    api_key: str,
+    model_name: str,
+    temperature: float,
+    base_url: Optional[str] = None,
+    system_api_key: Optional[str] = None,
+    system_base_url: Optional[str] = None,
+):
+    """Instantiate an LLM + embeddings pair for the given provider.
+
+    Providers:
+      - "openai"    — OpenAI or any OpenAI-compatible API (e.g. AIML API)
+      - "gemini"    — Google Gemini via langchain-google-genai
+      - "anthropic" — Anthropic Claude; falls back to system key for embeddings
+    """
+    if provider == "gemini":
+        from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+        llm = ChatGoogleGenerativeAI(
+            temperature=temperature,
+            model=model_name,
+            google_api_key=api_key,
+        )
+        embeddings = GoogleGenerativeAIEmbeddings(
+            model="models/gemini-embedding-2-preview",
+            google_api_key=api_key,
+        )
+
+    elif provider == "anthropic":
+        from langchain_anthropic import ChatAnthropic
+        from langchain_openai import OpenAIEmbeddings
+        llm = ChatAnthropic(
+            temperature=temperature,
+            model=model_name,
+            api_key=api_key,
+        )
+        # Anthropic has no embeddings API; fall back to system AIML/OpenAI key
+        embed_key = system_api_key or api_key
+        embed_kwargs: Dict = {"model": "text-embedding-3-small", "api_key": embed_key}
+        if system_base_url:
+            embed_kwargs["base_url"] = system_base_url
+        embeddings = OpenAIEmbeddings(**embed_kwargs)
+
+    else:  # "openai" / AIML API / any OpenAI-compatible endpoint
+        from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+        llm_kwargs: Dict = {
+            "temperature": temperature,
+            "model": model_name,
+            "api_key": api_key,
+        }
+        embed_kwargs: Dict = {"model": "text-embedding-3-small", "api_key": api_key}
+        if base_url:
+            llm_kwargs["base_url"] = base_url
+            embed_kwargs["base_url"] = base_url
+        llm = ChatOpenAI(**llm_kwargs)
+        embeddings = OpenAIEmbeddings(**embed_kwargs)
+
+    return llm, embeddings
+
+
 class InterviewSystem:
     """Main interview system that orchestrates all components"""
 
-    def __init__(self, gemini_api_key: str, config: Optional[InterviewConfig] = None):
+    def __init__(
+        self,
+        api_key: str,
+        config: Optional[InterviewConfig] = None,
+        provider: str = "openai",
+        base_url: Optional[str] = None,
+        system_api_key: Optional[str] = None,
+        system_base_url: Optional[str] = None,
+    ):
         self.config = config or InterviewConfig()
 
-        self.llm = ChatGoogleGenerativeAI(
+        self.llm, self.embeddings = _build_llm_and_embeddings(
+            provider=provider,
+            api_key=api_key,
+            model_name=self.config.model_name,
             temperature=self.config.temperature,
-            model=self.config.model_name,
-            google_api_key=gemini_api_key,
-        )
-
-        self.embeddings = GoogleGenerativeAIEmbeddings(
-            model="models/gemini-embedding-2-preview",
-            google_api_key=gemini_api_key,
+            base_url=base_url,
+            system_api_key=system_api_key,
+            system_base_url=system_base_url,
         )
 
         self.document_processor = DocumentProcessor(
