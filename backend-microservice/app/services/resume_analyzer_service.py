@@ -5,7 +5,9 @@ Resume Analyzer Service — multi-step AI analysis pipeline using the AIML API.
 import asyncio
 import json
 import logging
+import time
 from openai import AsyncOpenAI
+import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -13,6 +15,11 @@ _AIML_BASE_URL = "https://api.aimlapi.com/v1"
 _PARSE_MODEL = "openai/gpt-5-nano-2025-08-07"
 _SECTION_MODEL = "openai/gpt-5-nano-2025-08-07"
 _HOLISTIC_MODEL = "moonshot/kimi-k2-0905-preview"
+
+# Per-request timeout for AIML API calls (seconds)
+_API_TIMEOUT = 320.0
+# Overall analysis timeout (seconds)
+_ANALYSIS_TIMEOUT = 480.0
 
 _SECTIONS = ["contact", "summary", "experience", "education", "skills", "certifications", "projects"]
 
@@ -29,7 +36,14 @@ _SECTION_DISPLAY = {
 
 class ResumeAnalyzerService:
     def __init__(self, api_key: str):
-        self._client = AsyncOpenAI(api_key=api_key, base_url=_AIML_BASE_URL)
+        self._client = AsyncOpenAI(
+            api_key=api_key,
+            base_url=_AIML_BASE_URL,
+            # Configure httpx timeout to prevent hanging requests
+            http_client=httpx.AsyncClient(
+                timeout=httpx.Timeout(_API_TIMEOUT, connect=30.0)
+            ),
+        )
 
     # ── Public ──────────────────────────────────────────────────────────────────
 
@@ -41,6 +55,7 @@ class ResumeAnalyzerService:
         fb=None,
     ) -> dict:
         usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        analysis_start = time.monotonic()
 
         def _add(u):
             if u:
@@ -55,14 +70,65 @@ class ResumeAnalyzerService:
                 except Exception as e:
                     logger.warning(f"Failed to update step {step_name}: {e}")
 
+        logger.info(f"[resume_analysis] Starting analysis for '{filename}' (id={analysis_id})")
+
+        # Step 1: Parse sections
         _step("parsing_document")
-        parsed_sections = await self._parse_sections(resume_text, _add)
+        t0 = time.monotonic()
+        logger.info(f"[resume_analysis:{analysis_id}] Step 1/3 — parsing_document (model={_PARSE_MODEL})")
+        try:
+            parsed_sections = await asyncio.wait_for(
+                self._parse_sections(resume_text, _add),
+                timeout=_API_TIMEOUT,
+            )
+            logger.info(f"[resume_analysis:{analysis_id}] Step 1/3 done in {time.monotonic() - t0:.1f}s")
+        except asyncio.TimeoutError:
+            logger.error(f"[resume_analysis:{analysis_id}] Step 1/3 timed out after {_API_TIMEOUT}s")
+            raise
+        except Exception as e:
+            logger.error(f"[resume_analysis:{analysis_id}] Step 1/3 failed: {e}")
+            raise
 
+        # Step 2: Analyze sections (7 parallel calls)
         _step("analyzing_sections")
-        section_results = await self._analyze_sections(parsed_sections, _add)
+        t0 = time.monotonic()
+        logger.info(f"[resume_analysis:{analysis_id}] Step 2/3 — analyzing_sections ({len(_SECTIONS)} parallel calls, model={_SECTION_MODEL})")
+        try:
+            section_results = await asyncio.wait_for(
+                self._analyze_sections(parsed_sections, _add),
+                timeout=_API_TIMEOUT,
+            )
+            logger.info(f"[resume_analysis:{analysis_id}] Step 2/3 done in {time.monotonic() - t0:.1f}s")
+        except asyncio.TimeoutError:
+            logger.error(f"[resume_analysis:{analysis_id}] Step 2/3 timed out after {_API_TIMEOUT}s")
+            raise
+        except Exception as e:
+            logger.error(f"[resume_analysis:{analysis_id}] Step 2/3 failed: {e}")
+            raise
 
+        # Step 3: Holistic review
         _step("holistic_review")
-        holistic = await self._holistic_review(resume_text, _add)
+        t0 = time.monotonic()
+        logger.info(f"[resume_analysis:{analysis_id}] Step 3/3 — holistic_review (model={_HOLISTIC_MODEL})")
+        try:
+            holistic = await asyncio.wait_for(
+                self._holistic_review(resume_text, _add),
+                timeout=_API_TIMEOUT,
+            )
+            logger.info(f"[resume_analysis:{analysis_id}] Step 3/3 done in {time.monotonic() - t0:.1f}s")
+        except asyncio.TimeoutError:
+            logger.error(f"[resume_analysis:{analysis_id}] Step 3/3 timed out after {_API_TIMEOUT}s")
+            raise
+        except Exception as e:
+            logger.error(f"[resume_analysis:{analysis_id}] Step 3/3 failed: {e}")
+            raise
+
+        total_elapsed = time.monotonic() - analysis_start
+        logger.info(
+            f"[resume_analysis:{analysis_id}] Completed in {total_elapsed:.1f}s — "
+            f"tokens: prompt={usage['prompt_tokens']}, completion={usage['completion_tokens']}, "
+            f"total={usage['total_tokens']}"
+        )
 
         _step("saving_results")
 
