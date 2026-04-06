@@ -945,6 +945,77 @@ class FirebaseManager:
             logger.error(f"Error saving parsed sections for {analysis_id}: {e}")
             return False
 
+    def get_user_resume_analyses(self, user_id: str, limit: int = 50) -> List[Dict[str, Any]]:
+        """Get all resume analyses for a user, ordered by creation date descending."""
+        try:
+            docs = (
+                self.db.collection("resume_analyses")
+                .where(filter=FieldFilter("user_id", "==", user_id))
+                .order_by("created_at", direction=firestore.Query.DESCENDING)
+                .limit(limit)
+                .stream()
+            )
+            results = []
+            for doc in docs:
+                data = doc.to_dict()
+                data["id"] = doc.id
+                results.append(data)
+            return results
+        except Exception as e:
+            logger.error(f"Error fetching user resume analyses for {user_id}: {e}")
+            return []
+
+    def delete_resume_analysis(self, analysis_id: str, user_id: str) -> bool:
+        """Delete a resume analysis and its parsed sections (with ownership check)."""
+        try:
+            doc = self.db.collection("resume_analyses").document(analysis_id).get()
+            if not doc.exists:
+                return False
+            data = doc.to_dict()
+            if data.get("user_id") != user_id:
+                logger.warning(f"User {user_id} attempted to delete resume {analysis_id} owned by {data.get('user_id')}")
+                return False
+            # Delete parsed sections doc
+            self.db.collection("resume_parsed_sections").document(analysis_id).delete()
+            # Delete the analysis doc
+            self.db.collection("resume_analyses").document(analysis_id).delete()
+            # If this was the active resume, clear it from profile
+            profile = self.db.collection("profiles").document(user_id).get()
+            if profile.exists and profile.to_dict().get("current_analysis_id") == analysis_id:
+                # Find the next most recent analysis to set as active
+                analyses = self.get_user_resume_analyses(user_id, limit=2)
+                next_active_id = None
+                for a in analyses:
+                    if a["id"] != analysis_id and a.get("status") == "completed":
+                        next_active_id = a["id"]
+                        break
+                self.db.collection("profiles").document(user_id).update({
+                    "current_analysis_id": next_active_id,
+                    "updated_at": datetime.now().isoformat(),
+                })
+            return True
+        except Exception as e:
+            logger.error(f"Error deleting resume analysis {analysis_id}: {e}")
+            return False
+
+    def set_active_resume(self, user_id: str, analysis_id: str) -> bool:
+        """Set a specific resume analysis as the active one for a user."""
+        try:
+            doc = self.db.collection("resume_analyses").document(analysis_id).get()
+            if not doc.exists:
+                return False
+            data = doc.to_dict()
+            if data.get("user_id") != user_id:
+                return False
+            self.db.collection("profiles").document(user_id).update({
+                "current_analysis_id": analysis_id,
+                "updated_at": datetime.now().isoformat(),
+            })
+            return True
+        except Exception as e:
+            logger.error(f"Error setting active resume {analysis_id} for {user_id}: {e}")
+            return False
+
     def save_token_usage(
         self, user_id: str, feature: str, analysis_id: str, usage: dict
     ) -> bool:
