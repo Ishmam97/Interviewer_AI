@@ -4,6 +4,8 @@ Replaces the previous SupabaseManager with equivalent functionality.
 """
 
 import os
+import json
+import copy
 import logging
 import traceback
 from typing import Dict, List, Optional, Any
@@ -810,7 +812,10 @@ class FirebaseManager:
     def store_resume_data(
         self, user_id: str, resume_text: str, filename: str, analysis_id: str, analysis: dict
     ) -> bool:
-        """Store a lightweight resume summary in the user's profile document."""
+        """Update profile only for first-ever resume (sets active) or when this analysis is already active.
+
+        New uploads do not replace the user's active resume; user sets active via set_active_resume.
+        """
         try:
             parsed = analysis.get("parsed_sections", {})
             resume_summary = {
@@ -818,16 +823,24 @@ class FirebaseManager:
                 "contact": parsed.get("contact", {}),
                 "skills": parsed.get("skills", [])[:10],
             }
-            self.db.collection("profiles").document(user_id).set(
-                {
-                    "resume_filename": filename,
-                    "current_analysis_id": analysis_id,
-                    "resume_summary": resume_summary,
-                    "resume_updated_at": datetime.now().isoformat(),
-                    "updated_at": datetime.now().isoformat(),
-                },
-                merge=True,
-            )
+            prof_ref = self.db.collection("profiles").document(user_id)
+            prof_snap = prof_ref.get()
+            pdata = prof_snap.to_dict() if prof_snap.exists else {}
+            active_id = pdata.get("current_analysis_id")
+
+            update: Dict[str, Any] = {
+                "resume_updated_at": datetime.now().isoformat(),
+                "updated_at": datetime.now().isoformat(),
+            }
+            if not active_id:
+                update["current_analysis_id"] = analysis_id
+                update["resume_filename"] = filename
+                update["resume_summary"] = resume_summary
+            elif active_id == analysis_id:
+                update["resume_filename"] = filename
+                update["resume_summary"] = resume_summary
+
+            prof_ref.set(update, merge=True)
             return True
         except Exception as e:
             logger.error(f"Error storing resume data: {e}")
@@ -847,7 +860,12 @@ class FirebaseManager:
                 parsed_doc = self.db.collection("resume_parsed_sections").document(analysis_id).get()
                 if parsed_doc.exists:
                     parsed_data = parsed_doc.to_dict()
-                    analysis["parsed_sections"] = parsed_data.get("parsed_sections", {})
+                    baseline = parsed_data.get("parsed_sections", {})
+                    working = parsed_data.get("working_parsed_sections")
+                    if working is None:
+                        working = baseline
+                    analysis["parsed_sections"] = working
+                    analysis["original_parsed_sections"] = baseline
 
             return {
                 "resume_filename": profile.get("resume_filename", ""),
@@ -931,18 +949,124 @@ class FirebaseManager:
     def save_resume_parsed_sections(
         self, user_id: str, analysis_id: str, filename: str, parsed_sections: dict
     ) -> bool:
-        """Create/overwrite resume_parsed_sections/{analysis_id}."""
+        """Create/overwrite resume_parsed_sections/{analysis_id}.
+
+        Baseline ``parsed_sections`` is immutable after first save; ``working_parsed_sections``
+        is seeded to match and holds session edits (suggestions, manual PATCH).
+        """
         try:
+            baseline = copy.deepcopy(parsed_sections) if parsed_sections else {}
             self.db.collection("resume_parsed_sections").document(analysis_id).set({
                 "user_id": user_id,
                 "analysis_id": analysis_id,
                 "filename": filename,
-                "parsed_sections": parsed_sections,
+                "parsed_sections": baseline,
+                "working_parsed_sections": copy.deepcopy(baseline),
                 "created_at": datetime.now().isoformat(),
+                "updated_at": datetime.now().isoformat(),
             })
             return True
         except Exception as e:
             logger.error(f"Error saving parsed sections for {analysis_id}: {e}")
+            return False
+
+    def get_resume_parsed_doc(self, analysis_id: str) -> Optional[Dict[str, Any]]:
+        try:
+            doc = self.db.collection("resume_parsed_sections").document(analysis_id).get()
+            if doc.exists:
+                return doc.to_dict()
+            return None
+        except Exception as e:
+            logger.error(f"Error reading resume_parsed_sections {analysis_id}: {e}")
+            return None
+
+    def ensure_working_parsed_sections(self, analysis_id: str) -> bool:
+        """If working_parsed_sections is missing, copy from parsed_sections."""
+        try:
+            doc_ref = self.db.collection("resume_parsed_sections").document(analysis_id)
+            snap = doc_ref.get()
+            if not snap.exists:
+                return False
+            data = snap.to_dict()
+            if data.get("working_parsed_sections") is not None:
+                return True
+            baseline = data.get("parsed_sections") or {}
+            doc_ref.update({
+                "working_parsed_sections": copy.deepcopy(baseline),
+                "updated_at": datetime.now().isoformat(),
+            })
+            return True
+        except Exception as e:
+            logger.error(f"ensure_working_parsed_sections {analysis_id}: {e}")
+            return False
+
+    def set_working_parsed_sections(
+        self, analysis_id: str, user_id: str, working: dict
+    ) -> bool:
+        """Replace working_parsed_sections after ownership check."""
+        try:
+            doc_ref = self.db.collection("resume_parsed_sections").document(analysis_id)
+            snap = doc_ref.get()
+            if not snap.exists:
+                return False
+            data = snap.to_dict()
+            if data.get("user_id") != user_id:
+                return False
+            doc_ref.update({
+                "working_parsed_sections": copy.deepcopy(working),
+                "updated_at": datetime.now().isoformat(),
+            })
+            return True
+        except Exception as e:
+            logger.error(f"set_working_parsed_sections {analysis_id}: {e}")
+            return False
+
+    def merge_working_parsed_sections(
+        self, analysis_id: str, user_id: str, patch: dict
+    ) -> bool:
+        """Deep-merge patch into working_parsed_sections."""
+        try:
+            doc_ref = self.db.collection("resume_parsed_sections").document(analysis_id)
+            snap = doc_ref.get()
+            if not snap.exists:
+                return False
+            data = snap.to_dict()
+            if data.get("user_id") != user_id:
+                return False
+            self.ensure_working_parsed_sections(analysis_id)
+            snap = doc_ref.get()
+            data = snap.to_dict()
+            working = copy.deepcopy(data.get("working_parsed_sections") or data.get("parsed_sections") or {})
+
+            def _deep_merge(base: dict, upd: dict) -> dict:
+                for k, v in upd.items():
+                    if k in base and isinstance(base[k], dict) and isinstance(v, dict):
+                        _deep_merge(base[k], v)
+                    else:
+                        base[k] = copy.deepcopy(v)
+                return base
+
+            merged = _deep_merge(working, patch)
+            doc_ref.update({
+                "working_parsed_sections": merged,
+                "updated_at": datetime.now().isoformat(),
+            })
+            return True
+        except Exception as e:
+            logger.error(f"merge_working_parsed_sections {analysis_id}: {e}")
+            return False
+
+    def working_parsed_differs_from_baseline(self, analysis_id: str) -> bool:
+        try:
+            data = self.get_resume_parsed_doc(analysis_id)
+            if not data:
+                return False
+            a = data.get("parsed_sections") or {}
+            b = data.get("working_parsed_sections")
+            if b is None:
+                return False
+            return json.dumps(a, sort_keys=True, default=str) != json.dumps(b, sort_keys=True, default=str)
+        except Exception:
             return False
 
     def get_user_resume_analyses(self, user_id: str, limit: int = 50) -> List[Dict[str, Any]]:
