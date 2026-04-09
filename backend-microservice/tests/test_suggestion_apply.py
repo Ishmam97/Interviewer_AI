@@ -178,11 +178,13 @@ def _setup_firestore_for_snapshots(fb, snapshot_data=DUMMY_RESUME_DATA, snapshot
 
     # ── Collection reference that returns different doc refs based on document ID ──
     def document_side_effect(doc_id):
-        if doc_id.startswith("test-uid-123:"):
+        # Session-scoped snapshot id: uid:analysis_id:suggestion_id (two+ colons)
+        if doc_id.startswith("test-uid-123:") and doc_id.count(":") >= 2:
             return mock_snapshot_doc_ref
-        else:
-            # Treat as analysis_id → return parsed sections doc ref
-            return mock_parsed_doc_ref
+        # Legacy undo snapshot: uid:suggestion_id
+        if doc_id in ("test-uid-123:add_summary", "test-uid-123:quantify_bullets"):
+            return mock_snapshot_doc_ref
+        return mock_parsed_doc_ref
 
     mock_collection = MagicMock()
     mock_collection.document.side_effect = document_side_effect
@@ -216,7 +218,8 @@ def authed_client_with_ai(fb, ai_mock=None):
 
 def _setup_fb_with_resume(fb, analysis=None, profile_edited_data=None):
     """Configure the firebase mock to return resume data."""
-    analysis_data = analysis or DUMMY_ANALYSIS
+    analysis_data = dict(analysis or DUMMY_ANALYSIS)
+    analysis_data["user_id"] = "test-uid-123"
     profile = {
         "uid": "test-uid-123",
         "email": "test@example.com",
@@ -230,6 +233,15 @@ def _setup_fb_with_resume(fb, analysis=None, profile_edited_data=None):
         "current_analysis_id": "analysis-123",
     }
     fb.get_resume_analysis_by_id.return_value = analysis_data
+    fb.ensure_working_parsed_sections.return_value = True
+    resume_payload = profile_edited_data if profile_edited_data is not None else DUMMY_RESUME_DATA
+    fb.get_resume_parsed_doc.return_value = {
+        "user_id": "test-uid-123",
+        "analysis_id": "analysis-123",
+        "parsed_sections": resume_payload,
+        "working_parsed_sections": resume_payload,
+    }
+    fb.set_working_parsed_sections.return_value = True
 
 
 def _make_ai_mock(response_data):
@@ -271,15 +283,13 @@ class TestAcceptSuggestion:
         assert "applied_changes" in data
         assert data["applied_changes"]["section"] == "overall"
 
-        # Verify the resume was saved back
-        fb.update_user_profile_full.assert_called()
-        call_args = fb.update_user_profile_full.call_args
-        assert call_args[0][0] == "test-uid-123"
-        assert "edited_resume_data" in call_args[0][1]
-        saved_data = call_args[0][1]["edited_resume_data"]
+        fb.set_working_parsed_sections.assert_called()
+        call_args = fb.set_working_parsed_sections.call_args
+        assert call_args[0][0] == "analysis-123"
+        assert call_args[0][1] == "test-uid-123"
+        saved_data = call_args[0][2]
         assert saved_data["summary"] == DUMMY_AI_RESPONSE_SUMMARY["summary"]
 
-        # Verify the analysis status was updated
         fb.update_resume_analysis.assert_called()
 
     def test_accept_section_suggestion_applies_changes(self):
@@ -333,7 +343,7 @@ class TestAcceptSuggestion:
 
         # Verify snapshot was saved: db.collection("suggestion_snapshots").document(...).set(...)
         mock_db.collection.assert_called_with("suggestion_snapshots")
-        mock_collection.document.assert_called_with("test-uid-123:add_summary")
+        mock_collection.document.assert_called_with("test-uid-123:analysis-123:add_summary")
         mock_snapshot_doc_ref.set.assert_called()
         set_call = mock_snapshot_doc_ref.set.call_args
         assert set_call[0][0]["user_id"] == "test-uid-123"
@@ -341,7 +351,7 @@ class TestAcceptSuggestion:
         assert "snapshot_data" in set_call[0][0]
 
     def test_accept_suggestion_uses_edited_resume_data_if_exists(self):
-        """If profile has edited_resume_data, it should be used instead of parsed_sections."""
+        """Working copy from resume_parsed_sections is used (session-scoped)."""
         edited_data = {**DUMMY_RESUME_DATA, "name": "Edited Name"}
         fb = _make_firebase_mock()
         _setup_fb_with_resume(fb, profile_edited_data=edited_data)
@@ -354,10 +364,8 @@ class TestAcceptSuggestion:
             )
 
         assert r.status_code == 200
-        # The AI response should have been applied
-        fb.update_user_profile_full.assert_called()
-        call_args = fb.update_user_profile_full.call_args
-        saved_data = call_args[0][1]["edited_resume_data"]
+        fb.set_working_parsed_sections.assert_called()
+        saved_data = fb.set_working_parsed_sections.call_args[0][2]
         assert saved_data["summary"] == DUMMY_AI_RESPONSE_SUMMARY["summary"]
 
     def test_accept_rejected_suggestion_fails(self):
@@ -384,6 +392,7 @@ class TestAcceptSuggestion:
     def test_accept_invalid_action_fails(self):
         """Using an invalid action should return 400."""
         fb = _make_firebase_mock()
+        _setup_fb_with_resume(fb)
 
         with authed_client_with_ai(fb) as c:
             r = c.post(
@@ -462,6 +471,7 @@ class TestUndoSuggestion:
 
         # Mark suggestion as accepted
         analysis = dict(DUMMY_ANALYSIS)
+        analysis["user_id"] = "test-uid-123"
         analysis["overall"] = dict(DUMMY_ANALYSIS["overall"])
         analysis["overall"]["suggestions"] = [
             {**DUMMY_ANALYSIS["overall"]["suggestions"][0], "status": "accepted"},
@@ -476,10 +486,9 @@ class TestUndoSuggestion:
         assert data["suggestion_id"] == "add_summary"
         assert "restored" in data["message"].lower()
 
-        # Verify resume was restored
-        fb.update_user_profile_full.assert_called()
-        call_args = fb.update_user_profile_full.call_args
-        assert call_args[0][1]["edited_resume_data"] == DUMMY_RESUME_DATA
+        fb.set_working_parsed_sections.assert_called()
+        restore_call = fb.set_working_parsed_sections.call_args
+        assert restore_call[0][2] == DUMMY_RESUME_DATA
 
         # Verify status was reverted to pending
         fb.update_resume_analysis.assert_called()
@@ -586,16 +595,13 @@ class TestAcceptUndoRoundTrip:
             assert accept_resp.json()["status"] == "accepted"
             assert "applied_changes" in accept_resp.json()
 
-            # Step 2: Verify the resume was updated
-            update_call = fb.update_user_profile_full.call_args
-            updated_data = update_call[0][1]["edited_resume_data"]
+            update_call = fb.set_working_parsed_sections.call_args
+            updated_data = update_call[0][2]
             assert updated_data["summary"] == DUMMY_AI_RESPONSE_SUMMARY["summary"]
 
-            # Step 3: Undo the suggestion
             undo_resp = c.post("/profile/resume/suggestions/add_summary/undo")
             assert undo_resp.status_code == 200
 
-            # Step 4: Verify the resume was restored
-            restore_call = fb.update_user_profile_full.call_args
-            restored_data = restore_call[0][1]["edited_resume_data"]
+            restore_call = fb.set_working_parsed_sections.call_args
+            restored_data = restore_call[0][2]
             assert restored_data == DUMMY_RESUME_DATA
