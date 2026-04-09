@@ -147,6 +147,15 @@ class SuggestionActionRequest(BaseModel):
     action: str  # "accept" or "reject"
 
 
+class BulkSuggestionRequest(BaseModel):
+    suggestion_ids: List[str]  # original suggestion IDs to mark as accepted
+    section: str               # lowercase section key, e.g. "experience"
+
+
+class SectionUndoRequest(BaseModel):
+    section: str  # section key to undo, e.g. "experience"
+
+
 class SuggestionUndoRequest(BaseModel):
     pass
 
@@ -598,13 +607,21 @@ async def _apply_suggestion_to_resume(
     )
 
     try:
-        logger.info(f"[ApplySuggestion] Calling OpenAI with model=openai/gpt-4.1-mini-2025-04-14")
+        llm_model = "openai/gpt-4.1-mini-2025-04-14"
+        logger.info(f"[ApplySuggestion] Calling OpenAI with model={llm_model}")
         response = await client.chat.completions.create(
-            model="openai/gpt-4.1-mini-2025-04-14",
+            model=llm_model,
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"},
         )
-        logger.info(f"[ApplySuggestion] OpenAI response: usage={response.usage}")
+        usage = response.usage
+        logger.info(
+            f"[ApplySuggestion][TokenUsage] model={llm_model} "
+            f"prompt_tokens={usage.prompt_tokens if usage else '?'} "
+            f"completion_tokens={usage.completion_tokens if usage else '?'} "
+            f"total_tokens={usage.total_tokens if usage else '?'} "
+            f"section={section_name} suggestion_id={suggestion_id}"
+        )
         updated_data = json.loads(response.choices[0].message.content)
         logger.info(f"[ApplySuggestion] Parsed updated resume JSON (keys: {list(updated_data.keys())})")
 
@@ -622,7 +639,125 @@ async def _apply_suggestion_to_resume(
         return None
 
 
-async def _undo_suggestion_on_resume(
+async def _apply_bulk_suggestions_to_section(
+    fb: FirebaseManager,
+    user_id: str,
+    analysis_id: str,
+    section_key: str,
+    suggestion_items: list,  # [{"id": ..., "text": ...}, ...]
+) -> Optional[dict]:
+    """Apply multiple suggestions to a single section in one focused LLM call.
+
+    Uses a section-scoped prompt so the model only sees and returns the relevant
+    section — faster, cheaper, and less likely to corrupt other sections.
+    Saves per-suggestion snapshots so each can be individually undone.
+    Returns {"updated_section": <new_section_data>} or None on failure.
+    """
+    logger.info(
+        f"[BulkApply] Starting: user={user_id}, analysis={analysis_id}, "
+        f"section={section_key}, n={len(suggestion_items)}"
+    )
+
+    # Load working_parsed_sections from the per-analysis collection
+    parsed_doc = fb.db.collection("resume_parsed_sections").document(analysis_id).get()
+    if not parsed_doc.exists:
+        logger.warning(f"[BulkApply] No resume_parsed_sections doc for {analysis_id}")
+        return None
+
+    parsed_data = parsed_doc.to_dict()
+    working = parsed_data.get("working_parsed_sections") or parsed_data.get("parsed_sections") or {}
+    if not working:
+        logger.warning(f"[BulkApply] Empty parsed sections for {analysis_id}")
+        return None
+
+    # Resolve the section key (handle capitalised names from section.name)
+    _key_map = {
+        "contact": "contact", "summary": "summary", "experience": "experience",
+        "education": "education", "skills": "skills",
+        "certifications": "certifications", "projects": "projects",
+    }
+    resolved_key = _key_map.get(section_key.lower(), section_key.lower())
+    section_data = working.get(resolved_key)
+    if section_data is None:
+        logger.warning(f"[BulkApply] Section '{resolved_key}' not found in working_parsed_sections (keys: {list(working.keys())})")
+        return None
+
+    # Save a section-level snapshot (keyed by analysis:section) for group undo
+    snapshot_key = f"{analysis_id}:{resolved_key}"
+    fb.db.collection("section_snapshots").document(snapshot_key).set({
+        "user_id": user_id,
+        "analysis_id": analysis_id,
+        "section_key": resolved_key,
+        "snapshot_section": section_data,
+        "suggestion_ids": [item["id"] for item in suggestion_items],
+        "created_at": datetime.now().isoformat(),
+    })
+    logger.info(f"[BulkApply] Saved section snapshot for undo: {snapshot_key}")
+
+    api_key = settings.OPENAI_API_KEY
+    if not api_key:
+        logger.warning("[BulkApply] No OPENAI_API_KEY — cannot call LLM.")
+        return None
+
+    client = AsyncOpenAI(api_key=api_key)
+
+    numbered_suggestions = "\n".join(
+        f"{i + 1}. {item['text']}" for i, item in enumerate(suggestion_items)
+    )
+    section_json = json.dumps({resolved_key: section_data}, indent=2, ensure_ascii=False)
+
+    prompt = (
+        f"You are a professional resume editor. "
+        f"Apply ALL of the following suggestions to improve ONLY the \"{resolved_key}\" section.\n\n"
+        f"Current \"{resolved_key}\" section:\n{section_json}\n\n"
+        f"Suggestions to apply (apply every one of them):\n{numbered_suggestions}\n\n"
+        f"Return a JSON object with exactly ONE key: \"{resolved_key}\".\n"
+        f"The value must be the fully updated {resolved_key} data with all suggestions incorporated.\n"
+        f"Preserve the existing data structure and types exactly.\n"
+        f"Do NOT include any other sections, fields, or keys.\n"
+        f"Return ONLY valid JSON."
+    )
+
+    try:
+        logger.info(f"[BulkApply] Calling LLM for section='{resolved_key}' with {len(suggestion_items)} suggestions")
+        llm_model = "openai/gpt-4.1-mini-2025-04-14"
+        response = await client.chat.completions.create(
+            model=llm_model,
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+        )
+        usage = response.usage
+        logger.info(
+            f"[BulkApply][TokenUsage] model={llm_model} "
+            f"prompt_tokens={usage.prompt_tokens if usage else '?'} "
+            f"completion_tokens={usage.completion_tokens if usage else '?'} "
+            f"total_tokens={usage.total_tokens if usage else '?'} "
+            f"section={resolved_key} suggestions={len(suggestion_items)}"
+        )
+        result_data = json.loads(response.choices[0].message.content)
+        logger.info(f"[BulkApply] LLM returned keys: {list(result_data.keys())}")
+
+        updated_section = result_data.get(resolved_key)
+        if updated_section is None:
+            logger.error(f"[BulkApply] LLM response missing key '{resolved_key}': {result_data}")
+            return None
+
+        # Merge the updated section back into working_parsed_sections
+        new_working = dict(working)
+        new_working[resolved_key] = updated_section
+        fb.db.collection("resume_parsed_sections").document(analysis_id).update({
+            "working_parsed_sections": new_working,
+            "updated_at": datetime.now().isoformat(),
+        })
+        logger.info(f"[BulkApply] Saved updated '{resolved_key}' to resume_parsed_sections/{analysis_id}")
+
+        return {"updated_section": updated_section, "section_key": resolved_key, "previous_section": section_data}
+    except Exception as e:
+        logger.error(f"[BulkApply] LLM call failed: {e}", exc_info=True)
+        return None
+
+
+def _restore_suggestion_snapshot(
     fb: FirebaseManager,
     user_id: str,
     suggestion_id: str,
@@ -694,7 +829,7 @@ async def undo_suggestion(
         raise HTTPException(status_code=400, detail="Suggestion has not been accepted — nothing to undo.")
 
     # Restore the pre-accept state
-    restored = await _undo_suggestion_on_resume(fb, uid, suggestion_id)
+    restored = _restore_suggestion_snapshot(fb, uid, suggestion_id)
     if not restored:
         raise HTTPException(status_code=404, detail="No undo snapshot found. Changes may have already been overwritten.")
 
@@ -714,6 +849,133 @@ async def undo_suggestion(
     })
 
     return {"message": "Suggestion undone. Resume restored to previous state.", "suggestion_id": suggestion_id}
+
+
+@app.post("/profile/resumes/{analysis_id}/suggestions/bulk")
+async def apply_bulk_suggestions(
+    analysis_id: str,
+    request: BulkSuggestionRequest,
+    current_user=Depends(get_current_user),
+):
+    """Accept multiple suggestions at once and apply them to the given section in one LLM call."""
+    uid = _get_user_id(current_user)
+    fb = get_firebase_manager()
+
+    analysis = fb.get_resume_analysis_by_id(analysis_id)
+    if not analysis:
+        raise HTTPException(status_code=404, detail="Analysis not found")
+    if analysis.get("user_id") != uid:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    if analysis.get("status") != "completed":
+        raise HTTPException(status_code=400, detail="Analysis is not yet completed")
+
+    # Mark each suggestion as accepted in the analysis doc
+    suggestion_items = []  # [{"id": ..., "text": ...}]
+    ids_to_accept = set(request.suggestion_ids)
+    remaining = set(ids_to_accept)
+
+    for s in analysis.get("overall", {}).get("suggestions", []):
+        if s.get("id") in ids_to_accept:
+            s["status"] = "accepted"
+            suggestion_items.append({"id": s["id"], "text": s.get("text", "")})
+            remaining.discard(s["id"])
+
+    for sec in analysis.get("sections", []):
+        for s in sec.get("suggestions", []):
+            if s.get("id") in ids_to_accept:
+                s["status"] = "accepted"
+                suggestion_items.append({"id": s["id"], "text": s.get("text", "")})
+                remaining.discard(s["id"])
+
+    if not suggestion_items:
+        raise HTTPException(status_code=404, detail="No matching suggestions found")
+
+    fb.update_resume_analysis(analysis_id, {
+        "overall": analysis.get("overall", {}),
+        "sections": analysis.get("sections", []),
+    })
+
+    # Apply all suggestions to just that section in a single focused LLM call
+    result = await _apply_bulk_suggestions_to_section(
+        fb, uid, analysis_id, request.section, suggestion_items
+    )
+
+    return {
+        "message": f"{len(suggestion_items)} suggestion(s) applied to '{request.section}'",
+        "applied_count": len(suggestion_items),
+        "not_found_ids": list(remaining),
+        "updated_section": result.get("updated_section") if result else None,
+        "section_key": result.get("section_key") if result else request.section,
+        "previous_section": result.get("previous_section") if result else None,
+    }
+
+
+@app.post("/profile/resumes/{analysis_id}/suggestions/undo-section")
+async def undo_section_suggestions(
+    analysis_id: str,
+    request: SectionUndoRequest,
+    current_user=Depends(get_current_user),
+):
+    """Undo the last bulk-apply on a section, restoring the previous version and
+    reverting all accepted suggestions in that section back to pending."""
+    uid = _get_user_id(current_user)
+    fb = get_firebase_manager()
+
+    analysis = fb.get_resume_analysis_by_id(analysis_id)
+    if not analysis:
+        raise HTTPException(status_code=404, detail="Analysis not found")
+    if analysis.get("user_id") != uid:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    section_key = request.section.lower()
+    snapshot_key = f"{analysis_id}:{section_key}"
+    snap_doc = fb.db.collection("section_snapshots").document(snapshot_key).get()
+
+    if not snap_doc.exists:
+        raise HTTPException(status_code=404, detail="No undo snapshot for this section.")
+
+    snap = snap_doc.to_dict()
+    previous_section = snap.get("snapshot_section")
+    reverted_ids = snap.get("suggestion_ids", [])
+
+    if previous_section is None:
+        raise HTTPException(status_code=404, detail="Snapshot has no section data.")
+
+    # Restore the section in working_parsed_sections
+    parsed_doc = fb.db.collection("resume_parsed_sections").document(analysis_id).get()
+    if parsed_doc.exists:
+        parsed_data = parsed_doc.to_dict()
+        working = parsed_data.get("working_parsed_sections") or parsed_data.get("parsed_sections") or {}
+        working[section_key] = previous_section
+        fb.db.collection("resume_parsed_sections").document(analysis_id).update({
+            "working_parsed_sections": working,
+            "updated_at": datetime.now().isoformat(),
+        })
+
+    # Revert accepted suggestions back to pending
+    ids_set = set(reverted_ids)
+    for s in analysis.get("overall", {}).get("suggestions", []):
+        if s.get("id") in ids_set and s.get("status") == "accepted":
+            s["status"] = "pending"
+    for sec in analysis.get("sections", []):
+        for s in sec.get("suggestions", []):
+            if s.get("id") in ids_set and s.get("status") == "accepted":
+                s["status"] = "pending"
+
+    fb.update_resume_analysis(analysis_id, {
+        "overall": analysis.get("overall", {}),
+        "sections": analysis.get("sections", []),
+    })
+
+    # Delete the snapshot
+    fb.db.collection("section_snapshots").document(snapshot_key).delete()
+
+    return {
+        "message": f"Undone {len(reverted_ids)} suggestion(s) in '{section_key}'",
+        "reverted_ids": reverted_ids,
+        "restored_section": previous_section,
+        "section_key": section_key,
+    }
 
 
 # ── User Settings ─────────────────────────────────────────────────────────────
