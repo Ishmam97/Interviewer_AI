@@ -1140,6 +1140,122 @@ class FirebaseManager:
             logger.error(f"Error setting active resume {analysis_id} for {user_id}: {e}")
             return False
 
+    # ──────────────────────────────────────────────
+    # Dream Jobs
+    # ──────────────────────────────────────────────
+
+    def create_dream_job(
+        self,
+        uid: str,
+        dream_job_id: str,
+        company: str,
+        role_title: str,
+        jd_text: str,
+        source: str,
+        source_url: Optional[str],
+        resume_analysis_id: str,
+    ) -> bool:
+        """Create a new dream_jobs doc with status=pending."""
+        try:
+            self.db.collection("dream_jobs").document(dream_job_id).set({
+                "uid": uid,
+                "dream_job_id": dream_job_id,
+                "company": company,
+                "role_title": role_title,
+                "jd_text": jd_text,
+                "jd_normalized": {},
+                "source": source,
+                "source_url": source_url,
+                "resume_analysis_id": resume_analysis_id,
+                "status": "pending",
+                "current_step": "queued",
+                "error": None,
+                "result": {},
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                "created_at": datetime.now().isoformat(),
+                "updated_at": datetime.now().isoformat(),
+            })
+            return True
+        except Exception as e:
+            logger.error(f"Error creating dream job {dream_job_id}: {e}")
+            return False
+
+    def update_dream_job(self, dream_job_id: str, data: dict) -> bool:
+        """Update fields on an existing dream_jobs doc."""
+        try:
+            data["updated_at"] = datetime.now().isoformat()
+            self.db.collection("dream_jobs").document(dream_job_id).update(data)
+            return True
+        except Exception as e:
+            logger.error(f"Error updating dream job {dream_job_id}: {e}")
+            return False
+
+    def get_dream_job_by_id(self, dream_job_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch a single dream_jobs doc by ID."""
+        try:
+            doc = self.db.collection("dream_jobs").document(dream_job_id).get()
+            if doc.exists:
+                data = doc.to_dict()
+                data["id"] = doc.id
+                return data
+            return None
+        except Exception as e:
+            logger.error(f"Error fetching dream job {dream_job_id}: {e}")
+            return None
+
+    def list_user_dream_jobs(self, uid: str, limit: int = 50) -> list:
+        """Return summary records for all dream jobs owned by uid."""
+        try:
+            docs = (
+                self.db.collection("dream_jobs")
+                .where(filter=FieldFilter("uid", "==", uid))
+                .order_by("created_at", direction=firestore.Query.DESCENDING)
+                .limit(limit)
+                .stream()
+            )
+            results = []
+            for doc in docs:
+                data = doc.to_dict()
+                # Return summary fields only (omit heavy jd_text / result payload)
+                results.append({
+                    "id": doc.id,
+                    "dream_job_id": data.get("dream_job_id"),
+                    "company": data.get("company"),
+                    "role_title": data.get("role_title"),
+                    "source": data.get("source"),
+                    "source_url": data.get("source_url"),
+                    "resume_analysis_id": data.get("resume_analysis_id"),
+                    "status": data.get("status"),
+                    "current_step": data.get("current_step"),
+                    "fit_score": (data.get("result") or {}).get("fit_score"),
+                    "interview_chance": (data.get("result") or {}).get("interview_chance"),
+                    "created_at": data.get("created_at"),
+                    "updated_at": data.get("updated_at"),
+                })
+            return results
+        except Exception as e:
+            logger.error(f"Error listing dream jobs for {uid}: {e}")
+            return []
+
+    def delete_dream_job(self, dream_job_id: str, uid: str) -> bool:
+        """Delete a dream_jobs doc after verifying uid ownership."""
+        try:
+            doc = self.db.collection("dream_jobs").document(dream_job_id).get()
+            if not doc.exists:
+                return False
+            data = doc.to_dict()
+            if data.get("uid") != uid:
+                logger.warning(
+                    f"User {uid} attempted to delete dream job {dream_job_id} "
+                    f"owned by {data.get('uid')}"
+                )
+                return False
+            self.db.collection("dream_jobs").document(dream_job_id).delete()
+            return True
+        except Exception as e:
+            logger.error(f"Error deleting dream job {dream_job_id}: {e}")
+            return False
+
     def save_token_usage(
         self, user_id: str, feature: str, analysis_id: str, usage: dict
     ) -> bool:
