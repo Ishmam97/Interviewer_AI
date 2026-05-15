@@ -3,9 +3,11 @@ FastAPI backend for AI Interview Assistant (Firebase + Gemini)
 """
 
 import asyncio
+import json
 import logging
 import os
 import tempfile
+import time
 import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -17,13 +19,17 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from openai import AsyncOpenAI
 from pydantic import BaseModel
 
 from app.core.config import settings
 from app.database.firebase_db import FirebaseManager
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
 
 # ── App ───────────────────────────────────────────────────────────────────────
 
@@ -44,10 +50,27 @@ app.add_middleware(
 
 
 @app.middleware("http")
-async def log_requests(request: Request, call_next):
-    logger.info(f"{request.method} {request.url}")
+async def set_coop_header(request: Request, call_next):
+    """Set Cross-Origin-Opener-Policy header to allow OAuth popups."""
     response = await call_next(request)
-    logger.info(f"Response status: {response.status_code}")
+    response.headers["Cross-Origin-Opener-Policy"] = "same-origin-allow-popups"
+    return response
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    # Suppress health checks at INFO level — they dominate the logs
+    if request.url.path == "/health":
+        start = time.monotonic()
+        response = await call_next(request)
+        elapsed = time.monotonic() - start
+        logger.debug(f"{request.method} {request.url.path} — {response.status_code} ({elapsed*1000:.0f}ms)")
+        return response
+
+    start = time.monotonic()
+    response = await call_next(request)
+    elapsed = time.monotonic() - start
+    logger.info(f"{request.method} {request.url.path} — {response.status_code} ({elapsed*1000:.0f}ms)")
     return response
 
 
@@ -122,6 +145,19 @@ class AnswerRequest(BaseModel):
 
 class SuggestionActionRequest(BaseModel):
     action: str  # "accept" or "reject"
+
+
+class BulkSuggestionRequest(BaseModel):
+    suggestion_ids: List[str]  # original suggestion IDs to mark as accepted
+    section: str               # lowercase section key, e.g. "experience"
+
+
+class SectionUndoRequest(BaseModel):
+    section: str  # section key to undo, e.g. "experience"
+
+
+class SuggestionUndoRequest(BaseModel):
+    pass
 
 
 class InterviewResponse(BaseModel):
@@ -295,12 +331,17 @@ async def update_profile(request: ProfileUpdateRequest, current_user=Depends(get
 
 async def _run_resume_analysis_bg(uid: str, resume_text: str, filename: str, analysis_id: str):
     """Background task: run full resume analysis and persist to Firestore."""
-    from app.services.resume_analyzer_service import ResumeAnalyzerService
+    from app.services.resume_analyzer_service import ResumeAnalyzerService, _ANALYSIS_TIMEOUT
     fb = get_firebase_manager()
+    logger.info(f"[resume_analysis:{analysis_id}] Background task started for user {uid}, file='{filename}'")
     try:
         svc = ResumeAnalyzerService(api_key=settings.OPENAI_API_KEY)
-        analysis = await svc.analyze(resume_text, filename, analysis_id=analysis_id, fb=fb)
+        analysis = await asyncio.wait_for(
+            svc.analyze(resume_text, filename, analysis_id=analysis_id, fb=fb),
+            timeout=_ANALYSIS_TIMEOUT,
+        )
 
+        logger.info(f"[resume_analysis:{analysis_id}] Analysis complete, persisting to Firestore…")
         fb.update_resume_analysis(analysis_id, {
             "status": "completed",
             "current_step": "completed",
@@ -313,8 +354,16 @@ async def _run_resume_analysis_bg(uid: str, resume_text: str, filename: str, ana
         fb.save_resume_parsed_sections(uid, analysis_id, filename, analysis.get("parsed_sections", {}))
         fb.save_token_usage(uid, "resume_analysis", analysis_id, analysis.get("usage", {}))
         fb.store_resume_data(uid, resume_text, filename, analysis_id, analysis)
+        logger.info(f"[resume_analysis:{analysis_id}] All results saved to Firestore successfully")
+    except asyncio.TimeoutError:
+        logger.error(f"[resume_analysis:{analysis_id}] Timed out after {_ANALYSIS_TIMEOUT}s")
+        fb.update_resume_analysis(analysis_id, {
+            "status": "failed",
+            "current_step": "timeout",
+        })
     except Exception as e:
-        logger.error(f"Background resume analysis failed: {e}")
+        import traceback
+        logger.error(f"[resume_analysis:{analysis_id}] Failed: {e}\n{traceback.format_exc()}")
         fb.update_resume_analysis(analysis_id, {
             "status": "failed",
             "current_step": "failed",
@@ -423,17 +472,23 @@ async def update_suggestion(
 
     new_status = "accepted" if request.action == "accept" else "rejected"
     updated = False
+    matched_suggestion = None
+    section_name = None
 
     for s in analysis.get("overall", {}).get("suggestions", []):
         if s.get("id") == suggestion_id:
             s["status"] = new_status
             updated = True
+            matched_suggestion = s
+            section_name = "overall"
 
-    for section in analysis.get("sections", []):
-        for s in section.get("suggestions", []):
+    for sec in analysis.get("sections", []):
+        for s in sec.get("suggestions", []):
             if s.get("id") == suggestion_id:
                 s["status"] = new_status
                 updated = True
+                matched_suggestion = s
+                section_name = sec.get("name", "").lower()
 
     if not updated:
         raise HTTPException(status_code=404, detail="Suggestion not found.")
@@ -442,7 +497,485 @@ async def update_suggestion(
         "overall": analysis.get("overall", {}),
         "sections": analysis.get("sections", []),
     })
-    return {"message": "Suggestion updated", "suggestion_id": suggestion_id, "status": new_status}
+
+    # If accepted, apply the suggestion to the resume data in the profile
+    applied_changes = None
+    if request.action == "accept" and matched_suggestion:
+        applied_changes = await _apply_suggestion_to_resume(
+            fb, uid, suggestion_id, matched_suggestion.get("text", ""), section_name
+        )
+
+    result = {
+        "message": "Suggestion updated",
+        "suggestion_id": suggestion_id,
+        "status": new_status,
+    }
+    if applied_changes:
+        result["applied_changes"] = applied_changes
+
+    return result
+
+
+async def _apply_suggestion_to_resume(
+    fb: FirebaseManager,
+    user_id: str,
+    suggestion_id: str,
+    suggestion_text: str,
+    section_name: str,
+) -> Optional[dict]:
+    """Use the LLM to apply an accepted suggestion to the user's edited_resume_data.
+
+    Saves a snapshot before applying so the change can be undone.
+    Returns a dict describing what was changed, or None if nothing could be applied.
+    """
+    logger.info(f"[ApplySuggestion] Starting: user={user_id}, suggestion={suggestion_id}, section={section_name}")
+
+    # Get current edited_resume_data from profile (or parsed_sections from analysis)
+    profile = fb.get_user_profile(user_id)
+    if not profile:
+        logger.warning(f"[ApplySuggestion] No profile found for user {user_id}")
+        return None
+
+    edited_data = profile.get("edited_resume_data")
+    if not edited_data:
+        logger.info(f"[ApplySuggestion] No edited_resume_data in profile, falling back to parsed_sections")
+        # Fall back to parsed_sections — stored in a separate collection
+        analysis_id = profile.get("current_analysis_id")
+        if not analysis_id:
+            logger.warning(f"[ApplySuggestion] No current_analysis_id in profile for user {user_id}")
+            return None
+        # parsed_sections lives in resume_parsed_sections/{analysis_id}, not in the analysis doc
+        parsed_doc = fb.db.collection("resume_parsed_sections").document(analysis_id).get()
+        if parsed_doc.exists:
+            parsed_data = parsed_doc.to_dict()
+            edited_data = parsed_data.get("parsed_sections", {})
+            if edited_data:
+                logger.info(f"[ApplySuggestion] Loaded parsed_sections from resume_parsed_sections/{analysis_id} (keys: {list(edited_data.keys())})")
+        if not edited_data:
+            logger.warning(f"[ApplySuggestion] No parsed_sections found for analysis {analysis_id}")
+            return None
+    else:
+        logger.info(f"[ApplySuggestion] Using edited_resume_data from profile (keys: {list(edited_data.keys())})")
+
+    # Save a snapshot of the current state for undo
+    snapshot_ref = fb.db.collection("suggestion_snapshots").document(f"{user_id}:{suggestion_id}")
+    snapshot_ref.set({
+        "user_id": user_id,
+        "suggestion_id": suggestion_id,
+        "snapshot_data": edited_data,
+        "created_at": datetime.now().isoformat(),
+    })
+    logger.info(f"[ApplySuggestion] Snapshot saved for {user_id}:{suggestion_id}")
+
+    # Get the API key to use for the LLM call
+    api_key = settings.OPENAI_API_KEY
+    if not api_key:
+        logger.warning("No OPENAI_API_KEY configured — cannot apply suggestion to resume.")
+        return None
+
+    client = AsyncOpenAI(api_key=api_key)
+
+    section_context = ""
+    if section_name and section_name != "overall":
+        section_data = edited_data.get(section_name)
+        if section_data is not None:
+            section_context = json.dumps({section_name: section_data}, indent=2, ensure_ascii=False)
+        else:
+            # Try to find by display name mapping
+            display_map = {
+                "contact": "contact", "summary": "summary", "experience": "experience",
+                "education": "education", "skills": "skills", "certifications": "certifications",
+                "projects": "projects",
+            }
+            key = display_map.get(section_name)
+            if key and key in edited_data:
+                section_context = json.dumps({key: edited_data[key]}, indent=2, ensure_ascii=False)
+
+    full_context = json.dumps(edited_data, indent=2, ensure_ascii=False)
+
+    prompt = (
+        f"You are editing a resume based on an accepted suggestion.\n\n"
+        f"Current resume (JSON):\n{full_context}\n\n"
+        f"{f'Relevant section context:\n{section_context}\n\n' if section_context else ''}"
+        f"Suggestion: {suggestion_text}\n\n"
+        f"Return a JSON object with the updated resume structure. "
+        f"Only modify the fields necessary to address the suggestion. "
+        f"Keep the same overall structure and all other fields intact.\n\n"
+        f"If the suggestion is about adding notes or improvements that don't fit "
+        f"into existing fields, add a '_notes' key at the top level with an array of note strings.\n\n"
+        f"Return ONLY valid JSON, no markdown or explanations."
+    )
+
+    try:
+        llm_model = "openai/gpt-4.1-mini-2025-04-14"
+        logger.info(f"[ApplySuggestion] Calling OpenAI with model={llm_model}")
+        response = await client.chat.completions.create(
+            model=llm_model,
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+        )
+        usage = response.usage
+        logger.info(
+            f"[ApplySuggestion][TokenUsage] model={llm_model} "
+            f"prompt_tokens={usage.prompt_tokens if usage else '?'} "
+            f"completion_tokens={usage.completion_tokens if usage else '?'} "
+            f"total_tokens={usage.total_tokens if usage else '?'} "
+            f"section={section_name} suggestion_id={suggestion_id}"
+        )
+        updated_data = json.loads(response.choices[0].message.content)
+        logger.info(f"[ApplySuggestion] Parsed updated resume JSON (keys: {list(updated_data.keys())})")
+
+        # Save back to the profile
+        fb.update_user_profile_full(user_id, {"edited_resume_data": updated_data})
+        logger.info(f"[ApplySuggestion] Saved updated resume to profile.edited_resume_data")
+
+        # Return a summary of what changed
+        changes = {"section": section_name or "overall", "suggestion_applied": suggestion_text}
+        if "_notes" in updated_data:
+            changes["notes_added"] = updated_data["_notes"]
+        return changes
+    except Exception as e:
+        logger.error(f"[ApplySuggestion] Failed to apply suggestion: {e}", exc_info=True)
+        return None
+
+
+async def _apply_bulk_suggestions_to_section(
+    fb: FirebaseManager,
+    user_id: str,
+    analysis_id: str,
+    section_key: str,
+    suggestion_items: list,  # [{"id": ..., "text": ...}, ...]
+) -> Optional[dict]:
+    """Apply multiple suggestions to a single section in one focused LLM call.
+
+    Uses a section-scoped prompt so the model only sees and returns the relevant
+    section — faster, cheaper, and less likely to corrupt other sections.
+    Saves per-suggestion snapshots so each can be individually undone.
+    Returns {"updated_section": <new_section_data>} or None on failure.
+    """
+    logger.info(
+        f"[BulkApply] Starting: user={user_id}, analysis={analysis_id}, "
+        f"section={section_key}, n={len(suggestion_items)}"
+    )
+
+    # Load working_parsed_sections from the per-analysis collection
+    parsed_doc = fb.db.collection("resume_parsed_sections").document(analysis_id).get()
+    if not parsed_doc.exists:
+        logger.warning(f"[BulkApply] No resume_parsed_sections doc for {analysis_id}")
+        return None
+
+    parsed_data = parsed_doc.to_dict()
+    working = parsed_data.get("working_parsed_sections") or parsed_data.get("parsed_sections") or {}
+    if not working:
+        logger.warning(f"[BulkApply] Empty parsed sections for {analysis_id}")
+        return None
+
+    # Resolve the section key (handle capitalised names from section.name)
+    _key_map = {
+        "contact": "contact", "summary": "summary", "experience": "experience",
+        "education": "education", "skills": "skills",
+        "certifications": "certifications", "projects": "projects",
+    }
+    resolved_key = _key_map.get(section_key.lower(), section_key.lower())
+    section_data = working.get(resolved_key)
+    if section_data is None:
+        logger.warning(f"[BulkApply] Section '{resolved_key}' not found in working_parsed_sections (keys: {list(working.keys())})")
+        return None
+
+    # Save a section-level snapshot (keyed by analysis:section) for group undo
+    snapshot_key = f"{analysis_id}:{resolved_key}"
+    fb.db.collection("section_snapshots").document(snapshot_key).set({
+        "user_id": user_id,
+        "analysis_id": analysis_id,
+        "section_key": resolved_key,
+        "snapshot_section": section_data,
+        "suggestion_ids": [item["id"] for item in suggestion_items],
+        "created_at": datetime.now().isoformat(),
+    })
+    logger.info(f"[BulkApply] Saved section snapshot for undo: {snapshot_key}")
+
+    api_key = settings.OPENAI_API_KEY
+    if not api_key:
+        logger.warning("[BulkApply] No OPENAI_API_KEY — cannot call LLM.")
+        return None
+
+    client = AsyncOpenAI(api_key=api_key)
+
+    numbered_suggestions = "\n".join(
+        f"{i + 1}. {item['text']}" for i, item in enumerate(suggestion_items)
+    )
+    section_json = json.dumps({resolved_key: section_data}, indent=2, ensure_ascii=False)
+
+    prompt = (
+        f"You are a professional resume editor. "
+        f"Apply ALL of the following suggestions to improve ONLY the \"{resolved_key}\" section.\n\n"
+        f"Current \"{resolved_key}\" section:\n{section_json}\n\n"
+        f"Suggestions to apply (apply every one of them):\n{numbered_suggestions}\n\n"
+        f"Return a JSON object with exactly ONE key: \"{resolved_key}\".\n"
+        f"The value must be the fully updated {resolved_key} data with all suggestions incorporated.\n"
+        f"Preserve the existing data structure and types exactly.\n"
+        f"Do NOT include any other sections, fields, or keys.\n"
+        f"Return ONLY valid JSON."
+    )
+
+    try:
+        logger.info(f"[BulkApply] Calling LLM for section='{resolved_key}' with {len(suggestion_items)} suggestions")
+        llm_model = "openai/gpt-4.1-mini-2025-04-14"
+        response = await client.chat.completions.create(
+            model=llm_model,
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+        )
+        usage = response.usage
+        logger.info(
+            f"[BulkApply][TokenUsage] model={llm_model} "
+            f"prompt_tokens={usage.prompt_tokens if usage else '?'} "
+            f"completion_tokens={usage.completion_tokens if usage else '?'} "
+            f"total_tokens={usage.total_tokens if usage else '?'} "
+            f"section={resolved_key} suggestions={len(suggestion_items)}"
+        )
+        result_data = json.loads(response.choices[0].message.content)
+        logger.info(f"[BulkApply] LLM returned keys: {list(result_data.keys())}")
+
+        updated_section = result_data.get(resolved_key)
+        if updated_section is None:
+            logger.error(f"[BulkApply] LLM response missing key '{resolved_key}': {result_data}")
+            return None
+
+        # Merge the updated section back into working_parsed_sections
+        new_working = dict(working)
+        new_working[resolved_key] = updated_section
+        fb.db.collection("resume_parsed_sections").document(analysis_id).update({
+            "working_parsed_sections": new_working,
+            "updated_at": datetime.now().isoformat(),
+        })
+        logger.info(f"[BulkApply] Saved updated '{resolved_key}' to resume_parsed_sections/{analysis_id}")
+
+        return {"updated_section": updated_section, "section_key": resolved_key, "previous_section": section_data}
+    except Exception as e:
+        logger.error(f"[BulkApply] LLM call failed: {e}", exc_info=True)
+        return None
+
+
+def _restore_suggestion_snapshot(
+    fb: FirebaseManager,
+    user_id: str,
+    suggestion_id: str,
+) -> Optional[dict]:
+    """Restore the edited_resume_data from the snapshot saved before accepting a suggestion.
+
+    Returns the restored data, or None if no snapshot exists.
+    """
+    snapshot_id = f"{user_id}:{suggestion_id}"
+    snapshot_doc = fb.db.collection("suggestion_snapshots").document(snapshot_id).get()
+
+    if not snapshot_doc.exists:
+        logger.warning(f"No snapshot found for suggestion {suggestion_id}, user {user_id}")
+        return None
+
+    snapshot_data = snapshot_doc.to_dict().get("snapshot_data")
+    if not snapshot_data:
+        logger.warning(f"Snapshot for {suggestion_id} has no data")
+        return None
+
+    # Restore the snapshot as the current edited_resume_data
+    fb.update_user_profile_full(user_id, {"edited_resume_data": snapshot_data})
+
+    # Delete the snapshot so it can't be undone again
+    fb.db.collection("suggestion_snapshots").document(snapshot_id).delete()
+
+    return snapshot_data
+
+
+@app.post("/profile/resume/suggestions/{suggestion_id}/undo")
+async def undo_suggestion(
+    suggestion_id: str,
+    current_user=Depends(get_current_user),
+):
+    """Undo an accepted suggestion, restoring the resume to its pre-accept state."""
+    uid = _get_user_id(current_user)
+    fb = get_firebase_manager()
+
+    profile_data = fb.get_resume_data(uid)
+    if not profile_data:
+        raise HTTPException(status_code=404, detail="No resume data found.")
+    analysis_id = profile_data.get("current_analysis_id")
+    if not analysis_id:
+        raise HTTPException(status_code=404, detail="No resume analysis found.")
+
+    analysis = fb.get_resume_analysis_by_id(analysis_id)
+    if not analysis or analysis.get("status") != "completed":
+        raise HTTPException(status_code=404, detail="Completed resume analysis not found.")
+
+    # Find the suggestion and verify it's currently accepted
+    found = False
+    is_accepted = False
+
+    for s in analysis.get("overall", {}).get("suggestions", []):
+        if s.get("id") == suggestion_id:
+            found = True
+            is_accepted = s.get("status") == "accepted"
+
+    if not found:
+        for sec in analysis.get("sections", []):
+            for s in sec.get("suggestions", []):
+                if s.get("id") == suggestion_id:
+                    found = True
+                    is_accepted = s.get("status") == "accepted"
+
+    if not found:
+        raise HTTPException(status_code=404, detail="Suggestion not found.")
+    if not is_accepted:
+        raise HTTPException(status_code=400, detail="Suggestion has not been accepted — nothing to undo.")
+
+    # Restore the pre-accept state
+    restored = _restore_suggestion_snapshot(fb, uid, suggestion_id)
+    if not restored:
+        raise HTTPException(status_code=404, detail="No undo snapshot found. Changes may have already been overwritten.")
+
+    # Revert the suggestion status back to pending
+    for s in analysis.get("overall", {}).get("suggestions", []):
+        if s.get("id") == suggestion_id:
+            s["status"] = "pending"
+
+    for sec in analysis.get("sections", []):
+        for s in sec.get("suggestions", []):
+            if s.get("id") == suggestion_id:
+                s["status"] = "pending"
+
+    fb.update_resume_analysis(analysis_id, {
+        "overall": analysis.get("overall", {}),
+        "sections": analysis.get("sections", []),
+    })
+
+    return {"message": "Suggestion undone. Resume restored to previous state.", "suggestion_id": suggestion_id}
+
+
+@app.post("/profile/resumes/{analysis_id}/suggestions/bulk")
+async def apply_bulk_suggestions(
+    analysis_id: str,
+    request: BulkSuggestionRequest,
+    current_user=Depends(get_current_user),
+):
+    """Accept multiple suggestions at once and apply them to the given section in one LLM call."""
+    uid = _get_user_id(current_user)
+    fb = get_firebase_manager()
+
+    analysis = fb.get_resume_analysis_by_id(analysis_id)
+    if not analysis:
+        raise HTTPException(status_code=404, detail="Analysis not found")
+    if analysis.get("user_id") != uid:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    if analysis.get("status") != "completed":
+        raise HTTPException(status_code=400, detail="Analysis is not yet completed")
+
+    # Mark each suggestion as accepted in the analysis doc
+    suggestion_items = []  # [{"id": ..., "text": ...}]
+    ids_to_accept = set(request.suggestion_ids)
+    remaining = set(ids_to_accept)
+
+    for s in analysis.get("overall", {}).get("suggestions", []):
+        if s.get("id") in ids_to_accept:
+            s["status"] = "accepted"
+            suggestion_items.append({"id": s["id"], "text": s.get("text", "")})
+            remaining.discard(s["id"])
+
+    for sec in analysis.get("sections", []):
+        for s in sec.get("suggestions", []):
+            if s.get("id") in ids_to_accept:
+                s["status"] = "accepted"
+                suggestion_items.append({"id": s["id"], "text": s.get("text", "")})
+                remaining.discard(s["id"])
+
+    if not suggestion_items:
+        raise HTTPException(status_code=404, detail="No matching suggestions found")
+
+    fb.update_resume_analysis(analysis_id, {
+        "overall": analysis.get("overall", {}),
+        "sections": analysis.get("sections", []),
+    })
+
+    # Apply all suggestions to just that section in a single focused LLM call
+    result = await _apply_bulk_suggestions_to_section(
+        fb, uid, analysis_id, request.section, suggestion_items
+    )
+
+    return {
+        "message": f"{len(suggestion_items)} suggestion(s) applied to '{request.section}'",
+        "applied_count": len(suggestion_items),
+        "not_found_ids": list(remaining),
+        "updated_section": result.get("updated_section") if result else None,
+        "section_key": result.get("section_key") if result else request.section,
+        "previous_section": result.get("previous_section") if result else None,
+    }
+
+
+@app.post("/profile/resumes/{analysis_id}/suggestions/undo-section")
+async def undo_section_suggestions(
+    analysis_id: str,
+    request: SectionUndoRequest,
+    current_user=Depends(get_current_user),
+):
+    """Undo the last bulk-apply on a section, restoring the previous version and
+    reverting all accepted suggestions in that section back to pending."""
+    uid = _get_user_id(current_user)
+    fb = get_firebase_manager()
+
+    analysis = fb.get_resume_analysis_by_id(analysis_id)
+    if not analysis:
+        raise HTTPException(status_code=404, detail="Analysis not found")
+    if analysis.get("user_id") != uid:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    section_key = request.section.lower()
+    snapshot_key = f"{analysis_id}:{section_key}"
+    snap_doc = fb.db.collection("section_snapshots").document(snapshot_key).get()
+
+    if not snap_doc.exists:
+        raise HTTPException(status_code=404, detail="No undo snapshot for this section.")
+
+    snap = snap_doc.to_dict()
+    previous_section = snap.get("snapshot_section")
+    reverted_ids = snap.get("suggestion_ids", [])
+
+    if previous_section is None:
+        raise HTTPException(status_code=404, detail="Snapshot has no section data.")
+
+    # Restore the section in working_parsed_sections
+    parsed_doc = fb.db.collection("resume_parsed_sections").document(analysis_id).get()
+    if parsed_doc.exists:
+        parsed_data = parsed_doc.to_dict()
+        working = parsed_data.get("working_parsed_sections") or parsed_data.get("parsed_sections") or {}
+        working[section_key] = previous_section
+        fb.db.collection("resume_parsed_sections").document(analysis_id).update({
+            "working_parsed_sections": working,
+            "updated_at": datetime.now().isoformat(),
+        })
+
+    # Revert accepted suggestions back to pending
+    ids_set = set(reverted_ids)
+    for s in analysis.get("overall", {}).get("suggestions", []):
+        if s.get("id") in ids_set and s.get("status") == "accepted":
+            s["status"] = "pending"
+    for sec in analysis.get("sections", []):
+        for s in sec.get("suggestions", []):
+            if s.get("id") in ids_set and s.get("status") == "accepted":
+                s["status"] = "pending"
+
+    fb.update_resume_analysis(analysis_id, {
+        "overall": analysis.get("overall", {}),
+        "sections": analysis.get("sections", []),
+    })
+
+    # Delete the snapshot
+    fb.db.collection("section_snapshots").document(snapshot_key).delete()
+
+    return {
+        "message": f"Undone {len(reverted_ids)} suggestion(s) in '{section_key}'",
+        "reverted_ids": reverted_ids,
+        "restored_section": previous_section,
+        "section_key": section_key,
+    }
 
 
 # ── User Settings ─────────────────────────────────────────────────────────────
@@ -805,6 +1338,94 @@ async def live_interview_websocket(websocket: WebSocket, session_id: str):
 
     finally:
         _live_sessions.pop(session_id, None)
+
+
+# ── Resume versioning ─────────────────────────────────────────────────────────
+
+@app.get("/profile/resumes")
+async def get_user_resumes(current_user=Depends(get_current_user)):
+    """Return list of all resume analyses for the current user."""
+    uid = _get_user_id(current_user)
+    fb = get_firebase_manager()
+    analyses = fb.get_user_resume_analyses(uid) or []
+    profile = fb.get_user_profile(uid) or {}
+    active_id = profile.get("current_analysis_id")
+
+    results = []
+    for a in analyses:
+        # Fetch parsed sections for quality_score if available
+        parsed_doc = fb.db.collection("resume_parsed_sections").document(a["id"]).get()
+        has_parsed = parsed_doc.exists
+
+        results.append({
+            "analysis_id": a["id"],
+            "filename": a.get("filename", ""),
+            "created_at": a.get("created_at", ""),
+            "status": a.get("status", ""),
+            "quality_score": a.get("quality_score", 0),
+            "overall_score": a.get("overall", {}).get("overall_score", 0),
+            "is_active": a["id"] == active_id,
+            "has_parsed_sections": has_parsed,
+        })
+
+    return {"resumes": results}
+
+
+@app.get("/profile/resumes/{analysis_id}")
+async def get_resume_by_id(analysis_id: str, current_user=Depends(get_current_user)):
+    """Get a specific resume analysis by ID with parsed sections."""
+    uid = _get_user_id(current_user)
+    fb = get_firebase_manager()
+    
+    # Fetch the analysis document
+    doc = fb.get_resume_analysis_by_id(analysis_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Analysis not found")
+    if doc.get("user_id") != uid:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    
+    # Fetch parsed sections
+    parsed_doc = fb.db.collection("resume_parsed_sections").document(analysis_id).get()
+    parsed_sections = parsed_doc.to_dict().get("parsed_sections", {}) if parsed_doc.exists else {}
+    
+    response = {
+        "analysis_id": analysis_id,
+        "filename": doc.get("filename", ""),
+        "created_at": doc.get("created_at", ""),
+        "status": doc.get("status", ""),
+        "resume_analysis": {
+            "overall": doc.get("overall"),
+            "sections": doc.get("sections"),
+            "ats": doc.get("ats"),
+            "lackings": doc.get("lackings", []),
+            "quality_score": doc.get("quality_score", 0),
+            "parsed_sections": parsed_sections,
+            "usage": doc.get("usage"),
+        },
+    }
+    return response
+
+
+@app.delete("/profile/resumes/{analysis_id}")
+async def delete_resume(analysis_id: str, current_user=Depends(get_current_user)):
+    """Delete a resume version (with ownership check)."""
+    uid = _get_user_id(current_user)
+    fb = get_firebase_manager()
+    success = fb.delete_resume_analysis(analysis_id, uid)
+    if not success:
+        raise HTTPException(status_code=404, detail="Resume not found or access denied")
+    return {"message": "Resume deleted successfully", "analysis_id": analysis_id}
+
+
+@app.post("/profile/resumes/{analysis_id}/set-active")
+async def set_active_resume(analysis_id: str, current_user=Depends(get_current_user)):
+    """Set a specific resume analysis as the active one."""
+    uid = _get_user_id(current_user)
+    fb = get_firebase_manager()
+    success = fb.set_active_resume(uid, analysis_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Resume not found or access denied")
+    return {"message": "Active resume updated", "analysis_id": analysis_id}
 
 
 if __name__ == "__main__":
