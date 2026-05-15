@@ -143,6 +143,10 @@ class AnswerRequest(BaseModel):
     answer: str
 
 
+class PasswordUpdateRequest(BaseModel):
+    new_password: str
+
+
 class SuggestionActionRequest(BaseModel):
     action: str  # "accept" or "reject"
 
@@ -158,6 +162,19 @@ class SectionUndoRequest(BaseModel):
 
 class SuggestionUndoRequest(BaseModel):
     pass
+
+
+class DreamJobFromLinkRequest(BaseModel):
+    url: str
+
+
+class DreamJobCreateRequest(BaseModel):
+    company: str
+    role_title: str
+    jd_text: str
+    source: str  # "manual" | "link"
+    source_url: Optional[str] = None
+    resume_analysis_id: str
 
 
 class InterviewResponse(BaseModel):
@@ -297,13 +314,49 @@ async def google_signin(credentials: HTTPAuthorizationCredentials = Depends(_sec
 
 @app.get("/auth/me")
 async def get_current_user_info(current_user=Depends(get_current_user)):
+    uid = _get_user_id(current_user)
+    providers: List[str] = []
+    try:
+        from firebase_admin import auth as _fb_auth
+        record = _fb_auth.get_user(uid)
+        providers = [p.provider_id for p in (record.provider_data or [])]
+    except Exception as e:
+        logger.warning(f"Could not load provider info for {uid}: {e}")
     return {
         "user": {
-            "id": _get_user_id(current_user),
+            "id": uid,
             "email": getattr(current_user, "email", None),
             "name": getattr(current_user, "name", None),
+            "providers": providers,
+            "has_password": "password" in providers,
         }
     }
+
+
+@app.post("/auth/password")
+async def set_password(
+    request: PasswordUpdateRequest,
+    current_user=Depends(get_current_user),
+):
+    """Set or update the password for the current Firebase user.
+
+    Lets users who signed up via Google add a password credential to the same
+    Firebase account, so they can sign in with either method afterwards.
+    """
+    new_password = (request.new_password or "").strip()
+    if len(new_password) < 6:
+        raise HTTPException(
+            status_code=400,
+            detail="Password must be at least 6 characters",
+        )
+    uid = _get_user_id(current_user)
+    try:
+        from firebase_admin import auth as _fb_auth
+        _fb_auth.update_user(uid, password=new_password)
+    except Exception as e:
+        logger.error(f"Failed to update password for {uid}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to update password")
+    return {"message": "Password updated"}
 
 
 # ── Profile ───────────────────────────────────────────────────────────────────
@@ -1426,6 +1479,213 @@ async def set_active_resume(analysis_id: str, current_user=Depends(get_current_u
     if not success:
         raise HTTPException(status_code=404, detail="Resume not found or access denied")
     return {"message": "Active resume updated", "analysis_id": analysis_id}
+
+
+# ── Dream Job ─────────────────────────────────────────────────────────────────
+
+
+async def _run_dream_job_analysis_bg(
+    uid: str, dream_job_id: str, jd_text: str, resume_analysis_id: str
+):
+    """Background task: run full dream-job fit analysis and persist to Firestore."""
+    from app.services.dream_job_analyzer_service import (
+        DreamJobAnalyzerService,
+        _ANALYSIS_TIMEOUT,
+    )
+
+    fb = get_firebase_manager()
+    logger.info(
+        f"[dream_job_analysis:{dream_job_id}] Background task started for user {uid}"
+    )
+
+    try:
+        fb.update_dream_job(dream_job_id, {"status": "normalizing", "current_step": "starting"})
+
+        # Retrieve resume parsed sections from Firestore
+        parsed_doc = fb.get_resume_parsed_doc(resume_analysis_id)
+        if parsed_doc:
+            parsed_sections = (
+                parsed_doc.get("working_parsed_sections")
+                or parsed_doc.get("parsed_sections")
+                or {}
+            )
+        else:
+            parsed_sections = {}
+
+        # Raw resume text is not persisted — reconstruct from parsed sections.
+        # The Kimi fit prompt has the structured sections anyway, so this is sufficient.
+        import json as _json
+        resume_text = _json.dumps(parsed_sections, ensure_ascii=False)
+
+        svc = DreamJobAnalyzerService(api_key=settings.OPENAI_API_KEY)
+        analysis = await asyncio.wait_for(
+            svc.analyze(
+                jd_text=jd_text,
+                resume_parsed_sections=parsed_sections,
+                resume_text=resume_text,
+                dream_job_id=dream_job_id,
+                fb=fb,
+            ),
+            timeout=_ANALYSIS_TIMEOUT,
+        )
+
+        logger.info(
+            f"[dream_job_analysis:{dream_job_id}] Analysis complete, persisting to Firestore…"
+        )
+        fb.update_dream_job(dream_job_id, {
+            "status": "completed",
+            "current_step": "completed",
+            "jd_normalized": analysis["jd_normalized"],
+            "result": analysis["fit_analysis"],
+            "usage": analysis["usage"],
+            "error": None,
+        })
+        fb.save_token_usage(uid, "dream_job_analysis", dream_job_id, analysis["usage"])
+        logger.info(
+            f"[dream_job_analysis:{dream_job_id}] All results saved to Firestore successfully"
+        )
+
+    except asyncio.TimeoutError:
+        logger.error(
+            f"[dream_job_analysis:{dream_job_id}] Timed out after {_ANALYSIS_TIMEOUT}s"
+        )
+        fb.update_dream_job(dream_job_id, {
+            "status": "failed",
+            "current_step": "timeout",
+            "error": "Analysis timed out",
+        })
+    except Exception as e:
+        import traceback as _tb
+        logger.error(
+            f"[dream_job_analysis:{dream_job_id}] Failed: {e}\n{_tb.format_exc()}"
+        )
+        fb.update_dream_job(dream_job_id, {
+            "status": "failed",
+            "current_step": "failed",
+            "error": str(e),
+        })
+
+
+@app.post("/dream-job/from-link")
+async def dream_job_from_link(
+    request: DreamJobFromLinkRequest,
+    current_user=Depends(get_current_user),
+):
+    """Fetch a job posting URL and return prefill data for the dream-job form."""
+    from app.services import job_link_parser as _jlp
+    result = await _jlp.parse_job_url(request.url)
+
+    if result.get("error") == "url_rejected":
+        raise HTTPException(status_code=400, detail="URL rejected: not a public job posting URL")
+    if result.get("error") == "parse_failed":
+        raise HTTPException(status_code=422, detail="Could not parse job posting from that URL")
+
+    return {
+        "company": result.get("company"),
+        "role_title": result.get("role_title"),
+        "location": result.get("location"),
+        "jd_text": result.get("jd_text", ""),
+        "source_url": result.get("source_url"),
+        "source": result.get("source"),
+        "error": result.get("error"),  # e.g. "linkedin_blocked" — UI can show warning
+    }
+
+
+@app.post("/dream-job")
+async def create_dream_job(
+    request: DreamJobCreateRequest,
+    background_tasks: BackgroundTasks,
+    current_user=Depends(get_current_user),
+):
+    """Create a dream-job document and queue the fit analysis in the background."""
+    uid = _get_user_id(current_user)
+    fb = get_firebase_manager()
+
+    # Verify resume_analysis_id belongs to this user
+    resume_doc = fb.get_resume_analysis_by_id(request.resume_analysis_id)
+    if not resume_doc:
+        raise HTTPException(status_code=404, detail="Resume analysis not found")
+    if resume_doc.get("user_id") != uid:
+        raise HTTPException(status_code=403, detail="Resume analysis does not belong to you")
+    if resume_doc.get("status") != "completed":
+        raise HTTPException(
+            status_code=400,
+            detail="Resume analysis is not yet completed. Wait for it to finish first.",
+        )
+
+    dream_job_id = str(uuid.uuid4())
+    if not fb.create_dream_job(
+        uid=uid,
+        dream_job_id=dream_job_id,
+        company=request.company,
+        role_title=request.role_title,
+        jd_text=request.jd_text,
+        source=request.source,
+        source_url=request.source_url,
+        resume_analysis_id=request.resume_analysis_id,
+    ):
+        raise HTTPException(status_code=500, detail="Failed to create dream job record")
+
+    background_tasks.add_task(
+        _run_dream_job_analysis_bg,
+        uid,
+        dream_job_id,
+        request.jd_text,
+        request.resume_analysis_id,
+    )
+
+    return {"dream_job_id": dream_job_id, "status": "pending"}
+
+
+@app.get("/dream-job/{dream_job_id}/status")
+async def get_dream_job_status(dream_job_id: str, current_user=Depends(get_current_user)):
+    """Return lightweight status/progress for a dream-job analysis."""
+    uid = _get_user_id(current_user)
+    fb = get_firebase_manager()
+    doc = fb.get_dream_job_by_id(dream_job_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Dream job not found")
+    if doc.get("uid") != uid:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    response = {
+        "dream_job_id": dream_job_id,
+        "status": doc.get("status"),
+        "current_step": doc.get("current_step"),
+    }
+    if doc.get("error"):
+        response["error"] = doc["error"]
+    return response
+
+
+@app.get("/dream-job/{dream_job_id}")
+async def get_dream_job(dream_job_id: str, current_user=Depends(get_current_user)):
+    """Return the full dream-job document (ownership verified)."""
+    uid = _get_user_id(current_user)
+    fb = get_firebase_manager()
+    doc = fb.get_dream_job_by_id(dream_job_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Dream job not found")
+    if doc.get("uid") != uid:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    return doc
+
+
+@app.get("/dream-jobs")
+async def list_dream_jobs(current_user=Depends(get_current_user)):
+    """Return summary list of dream jobs for the authenticated user."""
+    uid = _get_user_id(current_user)
+    fb = get_firebase_manager()
+    return {"dream_jobs": fb.list_user_dream_jobs(uid)}
+
+
+@app.delete("/dream-job/{dream_job_id}")
+async def delete_dream_job(dream_job_id: str, current_user=Depends(get_current_user)):
+    """Delete a dream-job document (ownership verified)."""
+    uid = _get_user_id(current_user)
+    fb = get_firebase_manager()
+    if not fb.delete_dream_job(dream_job_id, uid):
+        raise HTTPException(status_code=404, detail="Dream job not found or access denied")
+    return {"message": "Dream job deleted", "dream_job_id": dream_job_id}
 
 
 if __name__ == "__main__":
