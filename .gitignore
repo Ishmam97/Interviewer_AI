@@ -1,4 +1,6 @@
 # Byte-compiled / optimized / DLL files
+docs/*
+vendor/mcpvault/node_modules/
 __pycache__/
 */__pycache__/
 *.py[cod]
