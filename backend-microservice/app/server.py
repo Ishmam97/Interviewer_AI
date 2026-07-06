@@ -1120,7 +1120,6 @@ async def start_interview(
     temperature: float = Form(0.3),
     current_user=Depends(get_current_user),
 ):
-    from app.services.interview_system import InterviewSystem
     from app.services.models import InterviewConfig
 
     user_id = _get_user_id(current_user)
@@ -1161,7 +1160,7 @@ async def start_interview(
             f.write(job_bytes); job_path = f.name
 
         config = InterviewConfig(max_questions=max_questions, model_name=effective_model, temperature=temperature)
-        system = InterviewSystem(
+        system = _create_interview_system(
             api_key=resolved_key,
             config=config,
             provider=provider,
