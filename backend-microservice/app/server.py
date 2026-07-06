@@ -1246,6 +1246,49 @@ async def get_interview_session(session_id: str, current_user=Depends(get_curren
     return session
 
 
+@app.get("/interview/{session_id}/report")
+async def get_report_by_session(session_id: str, current_user=Depends(get_current_user)):
+    """Return the saved report content for a given interview session.
+
+    Matches the frontend contract (ApiService.getReport → /interview/{id}/report).
+    """
+    uid = _get_user_id(current_user)
+    fb = get_firebase_manager()
+    reports = fb.get_user_reports(uid) or []
+    match = next((r for r in reports if r.get("session_id") == session_id), None)
+    if not match:
+        raise HTTPException(status_code=404, detail="Report not found")
+    return {
+        "content": match.get("report_content") or match.get("content") or "",
+        "report_id": match.get("id"),
+        "session_id": session_id,
+    }
+
+
+@app.get("/reports")
+async def get_reports(current_user=Depends(get_current_user), limit: int = 50):
+    """List the current user's saved interview reports."""
+    uid = _get_user_id(current_user)
+    fb = get_firebase_manager()
+    try:
+        reports = fb.get_user_reports(uid, limit) or []
+    except Exception:
+        reports = []
+    return {"reports": reports}
+
+
+@app.get("/dashboard/stats")
+async def get_dashboard_stats(current_user=Depends(get_current_user)):
+    """Aggregate dashboard statistics for the current user."""
+    uid = _get_user_id(current_user)
+    fb = get_firebase_manager()
+    try:
+        stats = fb.get_user_dashboard_stats(uid) or {}
+    except Exception:
+        stats = {}
+    return stats
+
+
 @app.get("/interview/sessions/{session_id}/report")
 async def get_interview_report(session_id: str, current_user=Depends(get_current_user)):
     uid = _get_user_id(current_user)
