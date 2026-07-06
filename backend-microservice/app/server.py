@@ -300,7 +300,16 @@ async def signup(credentials: UserCredentials):
         if "already" in error.lower() or "exists" in error.lower():
             raise HTTPException(status_code=409, detail=error)
         raise HTTPException(status_code=400, detail=error)
+
+    # Exchange the custom token for an ID token so the client is logged in
+    # immediately after signup (no separate sign-in round-trip needed).
     session = result.get("session", {})
+    if not session.get("access_token"):
+        custom_token = result.get("custom_token")
+        if custom_token:
+            id_token = fb.exchange_custom_token(custom_token)
+            if id_token:
+                session = {"access_token": id_token}
     return {
         "message": "Account created",
         "user": result.get("user"),
