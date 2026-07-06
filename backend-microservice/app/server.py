@@ -267,6 +267,28 @@ async def health_check():
     return {"status": "healthy", "timestamp": datetime.now().isoformat()}
 
 
+@app.get("/admin/health")
+async def admin_health_check():
+    """Deep health check: reports API status plus database connectivity.
+
+    Used by uptime monitoring to distinguish "process up" from "process up but
+    Firestore unreachable". Never raises — always returns 200 with a status body.
+    """
+    database_status = "unknown"
+    try:
+        fb = get_firebase_manager()
+        conn = fb.test_connection()
+        database_status = "healthy" if conn.get("success") else "unhealthy"
+    except Exception as e:
+        logger.error(f"Admin health check DB probe failed: {e}")
+        database_status = "unhealthy"
+    return {
+        "api_status": "healthy",
+        "database_status": database_status,
+        "timestamp": datetime.now().isoformat(),
+    }
+
+
 # ── Auth endpoints ────────────────────────────────────────────────────────────
 
 @app.post("/auth/signup")
