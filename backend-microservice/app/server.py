@@ -212,6 +212,27 @@ async def _validate_upload(upload: UploadFile, field: str, max_bytes: int = 10 *
         raise HTTPException(status_code=400, detail=f"{field} must be a PDF or TXT file")
     return content
 
+def _create_interview_system(
+    api_key: str,
+    config,
+    provider: str,
+    base_url,
+    system_api_key,
+    system_base_url,
+):
+    """Construct an InterviewSystem. Extracted as a seam so routes stay testable
+    (tests patch this instead of the heavy LLM/RAG constructor)."""
+    from app.services.interview_system import InterviewSystem
+
+    return InterviewSystem(
+        api_key=api_key,
+        config=config,
+        provider=provider,
+        base_url=base_url,
+        system_api_key=system_api_key,
+        system_base_url=system_base_url,
+    )
+
 
 async def _run_resume_analysis(resume_text: str) -> dict:
     """Run AI analysis on resume text using Gemini."""
