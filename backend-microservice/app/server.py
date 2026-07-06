@@ -714,7 +714,7 @@ async def _apply_suggestion_to_resume(
     )
 
     try:
-        llm_model = "openai/gpt-4.1-mini-2025-04-14"
+        llm_model = settings.SUGGESTION_APPLY_MODEL
         logger.info(f"[ApplySuggestion] Calling OpenAI with model={llm_model}")
         response = await client.chat.completions.create(
             model=llm_model,
@@ -827,7 +827,7 @@ async def _apply_bulk_suggestions_to_section(
 
     try:
         logger.info(f"[BulkApply] Calling LLM for section='{resolved_key}' with {len(suggestion_items)} suggestions")
-        llm_model = "openai/gpt-4.1-mini-2025-04-14"
+        llm_model = settings.SUGGESTION_APPLY_MODEL
         response = await client.chat.completions.create(
             model=llm_model,
             messages=[{"role": "user", "content": prompt}],
