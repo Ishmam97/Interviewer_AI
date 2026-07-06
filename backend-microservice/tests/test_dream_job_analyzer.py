@@ -185,8 +185,10 @@ class TestDreamJobAnalyzerService:
         assert "normalizing" in statuses_written
         assert "analyzing" in statuses_written
 
-    def test_normalize_jd_error_returns_empty_structure(self):
-        """If the LLM call fails, _normalize_jd returns a safe empty structure."""
+    def test_normalize_jd_error_raises(self):
+        """A provider error in _normalize_jd must propagate (fail loud), so the
+        background task marks the dream job `failed` instead of persisting an
+        empty JD as a completed analysis."""
         from app.services.dream_job_analyzer_service import DreamJobAnalyzerService
 
         svc = DreamJobAnalyzerService(api_key="test-key")
@@ -197,14 +199,12 @@ class TestDreamJobAnalyzerService:
         svc._client = MagicMock()
         svc._client.chat.completions.create = _failing_create
 
-        result = asyncio.run(svc._normalize_jd(DUMMY_JD_TEXT, lambda u: None))
+        with pytest.raises(RuntimeError):
+            asyncio.run(svc._normalize_jd(DUMMY_JD_TEXT, lambda u: None))
 
-        assert result["role_title"] == ""
-        assert result["must_have_skills"] == []
-        assert result["keywords"] == []
-
-    def test_fit_analysis_error_returns_zero_scores(self):
-        """If Kimi call fails, _fit_analysis returns safe zero-scored structure."""
+    def test_fit_analysis_error_raises(self):
+        """A provider error in _fit_analysis must propagate rather than returning
+        a fit_score of 0 that gets persisted as a completed report."""
         from app.services.dream_job_analyzer_service import DreamJobAnalyzerService
 
         svc = DreamJobAnalyzerService(api_key="test-key")
@@ -215,21 +215,17 @@ class TestDreamJobAnalyzerService:
         svc._client = MagicMock()
         svc._client.chat.completions.create = _failing_create
 
-        result = asyncio.run(svc._fit_analysis(
-            DUMMY_RESUME_SECTIONS,
-            DUMMY_JD_NORMALIZED,
-            DUMMY_JD_TEXT,
-            DUMMY_RESUME_TEXT,
-            lambda u: None,
-        ))
+        with pytest.raises(RuntimeError):
+            asyncio.run(svc._fit_analysis(
+                DUMMY_RESUME_SECTIONS,
+                DUMMY_JD_NORMALIZED,
+                DUMMY_JD_TEXT,
+                DUMMY_RESUME_TEXT,
+                lambda u: None,
+            ))
 
-        assert result["fit_score"] == 0
-        assert result["interview_chance"] == 0
-        assert result["matching_strengths"] == []
-        assert result["gaps"] == []
-
-    def test_normalize_jd_malformed_json_falls_back(self):
-        """_normalize_jd falls back to safe empty struct when LLM emits invalid JSON."""
+    def test_normalize_jd_malformed_json_raises(self):
+        """Invalid JSON from the model must raise, not silently degrade to empty."""
         from app.services.dream_job_analyzer_service import DreamJobAnalyzerService
 
         svc = DreamJobAnalyzerService(api_key="test-key")
@@ -244,12 +240,11 @@ class TestDreamJobAnalyzerService:
         svc._client = MagicMock()
         svc._client.chat.completions.create = _bad_json_create
 
-        result = asyncio.run(svc._normalize_jd(DUMMY_JD_TEXT, lambda u: None))
-        assert result["role_title"] == ""
-        assert result["must_have_skills"] == []
+        with pytest.raises(json.JSONDecodeError):
+            asyncio.run(svc._normalize_jd(DUMMY_JD_TEXT, lambda u: None))
 
-    def test_fit_analysis_malformed_json_falls_back(self):
-        """_fit_analysis falls back to zero-score struct when LLM emits invalid JSON."""
+    def test_fit_analysis_malformed_json_raises(self):
+        """Invalid JSON from the model must raise, not degrade to a zero-score report."""
         from app.services.dream_job_analyzer_service import DreamJobAnalyzerService
 
         svc = DreamJobAnalyzerService(api_key="test-key")
@@ -264,15 +259,14 @@ class TestDreamJobAnalyzerService:
         svc._client = MagicMock()
         svc._client.chat.completions.create = _bad_json_create
 
-        result = asyncio.run(svc._fit_analysis(
-            DUMMY_RESUME_SECTIONS,
-            DUMMY_JD_NORMALIZED,
-            DUMMY_JD_TEXT,
-            DUMMY_RESUME_TEXT,
-            lambda u: None,
-        ))
-        assert result["fit_score"] == 0
-        assert result["ats_keyword_coverage"]["matched"] == []
+        with pytest.raises(json.JSONDecodeError):
+            asyncio.run(svc._fit_analysis(
+                DUMMY_RESUME_SECTIONS,
+                DUMMY_JD_NORMALIZED,
+                DUMMY_JD_TEXT,
+                DUMMY_RESUME_TEXT,
+                lambda u: None,
+            ))
 
     def test_analyze_without_fb_does_not_crash(self):
         """analyze() with fb=None must complete without AttributeError."""
