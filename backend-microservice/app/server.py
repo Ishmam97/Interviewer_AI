@@ -205,6 +205,8 @@ async def _validate_upload(upload: UploadFile, field: str, max_bytes: int = 10 *
     content = await upload.read()
     if len(content) > max_bytes:
         raise HTTPException(status_code=413, detail=f"{field} exceeds 10 MB limit")
+    if len(content) == 0:
+        raise HTTPException(status_code=400, detail=f"{field} file is empty")
     filename = (upload.filename or "").lower()
     if not (filename.endswith(".pdf") or filename.endswith(".txt")):
         raise HTTPException(status_code=400, detail=f"{field} must be a PDF or TXT file")
