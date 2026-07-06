@@ -37,7 +37,7 @@ class TestSignUp:
             "custom_token": "custom-token",
         }
 
-    def test_signup_weak_password_raises_422(self, client, firebase_mock):
+    def test_signup_weak_password_raises_400(self, client, firebase_mock):
         firebase_mock.sign_up.return_value = {
             "success": False,
             "error": "Password should contain at least 8 characters",
@@ -46,7 +46,7 @@ class TestSignUp:
             "email": "weak@example.com",
             "password": "abc",
         })
-        assert r.status_code == 422
+        assert r.status_code == 400
         # restore
         firebase_mock.sign_up.return_value = {
             "success": True,

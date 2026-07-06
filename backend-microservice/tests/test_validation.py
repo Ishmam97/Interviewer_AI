@@ -29,26 +29,26 @@ async def test_valid_pdf_file():
     assert result == content
 
 
-async def test_invalid_extension_raises_422():
+async def test_invalid_extension_raises_400():
     from app.server import _validate_upload
     with pytest.raises(HTTPException) as exc:
         await _validate_upload(_make_upload("resume.docx", b"data"), "resume")
-    assert exc.value.status_code == 422
-    assert ".docx" in exc.value.detail
+    assert exc.value.status_code == 400
+    assert "PDF or TXT" in exc.value.detail
 
 
-async def test_empty_file_raises_422():
+async def test_empty_file_raises_400():
     from app.server import _validate_upload
     with pytest.raises(HTTPException) as exc:
         await _validate_upload(_make_upload("resume.txt", b""), "resume")
-    assert exc.value.status_code == 422
+    assert exc.value.status_code == 400
     assert "empty" in exc.value.detail.lower()
 
 
-async def test_oversized_file_raises_422():
+async def test_oversized_file_raises_413():
     from app.server import _validate_upload
     big = b"x" * (10 * 1024 * 1024 + 1)
     with pytest.raises(HTTPException) as exc:
         await _validate_upload(_make_upload("resume.txt", big), "resume")
-    assert exc.value.status_code == 422
-    assert "large" in exc.value.detail.lower()
+    assert exc.value.status_code == 413
+    assert "10 mb" in exc.value.detail.lower()

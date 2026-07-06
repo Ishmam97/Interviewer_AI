@@ -184,7 +184,7 @@ class TestInterviewStart:
                 "job_description": ("jd.txt", b"jd", "text/plain"),
             },
         )
-        assert r.status_code == 422
+        assert r.status_code == 400
 
     def test_start_empty_file(self, client):
         r = client.post(
@@ -195,7 +195,7 @@ class TestInterviewStart:
                 "job_description": ("jd.txt", b"jd", "text/plain"),
             },
         )
-        assert r.status_code == 422
+        assert r.status_code == 400
 
 
 # ── /interview/answer ─────────────────────────────────────────────────────────

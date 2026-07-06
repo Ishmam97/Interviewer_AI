@@ -40,7 +40,7 @@ class TestProfile:
     def test_update_profile(self, client):
         r = client.put("/profile", json={"full_name": "Updated Name"})
         assert r.status_code == 200
-        assert r.json()["message"] == "Profile updated"
+        assert r.json()["message"] == "Profile updated successfully"
 
     def test_get_resume_analysis_none(self, client, firebase_mock):
         firebase_mock.get_resume_data.return_value = None
@@ -63,11 +63,11 @@ class TestProfile:
             "/profile/resume",
             files={"resume": ("resume.exe", b"data", "application/octet-stream")},
         )
-        assert r.status_code == 422
+        assert r.status_code == 400
 
     def test_upload_resume_empty(self, client):
         r = client.post(
             "/profile/resume",
             files={"resume": ("resume.txt", b"", "text/plain")},
         )
-        assert r.status_code == 422
+        assert r.status_code == 400
