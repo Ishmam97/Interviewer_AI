@@ -624,12 +624,13 @@ class FirebaseManager:
             reports = []
             for doc in docs:
                 data = doc.to_dict()
-                # Only return summary fields for list view
                 reports.append(
                     {
                         "id": doc.id,
+                        "session_id": data.get("session_id", ""),
                         "title": data.get("title", ""),
                         "created_at": data.get("created_at", ""),
+                        "report_content": data.get("report_content", ""),
                     }
                 )
 
