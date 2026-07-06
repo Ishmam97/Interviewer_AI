@@ -57,6 +57,16 @@ class Settings(BaseSettings):
     GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
     DEFAULT_MODEL: str = os.getenv("DEFAULT_MODEL", "gpt-4.1-nano-2025-04-14")
 
+    # AIML API model IDs (config-driven so a model change / outage is an env edit,
+    # not a code change). Override via env if the provider retires an ID.
+    AIML_BASE_URL: str = os.getenv("AIML_BASE_URL", "https://api.aimlapi.com/v1")
+    RESUME_PARSE_MODEL: str = os.getenv("RESUME_PARSE_MODEL", "openai/gpt-5-nano-2025-08-07")
+    RESUME_SECTION_MODEL: str = os.getenv("RESUME_SECTION_MODEL", "openai/gpt-5-nano-2025-08-07")
+    RESUME_HOLISTIC_MODEL: str = os.getenv("RESUME_HOLISTIC_MODEL", "moonshot/kimi-k2-0905-preview")
+    DREAM_JOB_NORMALIZE_MODEL: str = os.getenv("DREAM_JOB_NORMALIZE_MODEL", "openai/gpt-5-nano-2025-08-07")
+    DREAM_JOB_FIT_MODEL: str = os.getenv("DREAM_JOB_FIT_MODEL", "moonshot/kimi-k2-0905-preview")
+    SUGGESTION_APPLY_MODEL: str = os.getenv("SUGGESTION_APPLY_MODEL", "openai/gpt-4.1-mini-2025-04-14")
+
     # Interview Configuration
     MAX_QUESTIONS: int = int(os.getenv("MAX_QUESTIONS", "5"))
     CHUNK_SIZE: int = int(os.getenv("CHUNK_SIZE", "800"))
