@@ -9,12 +9,16 @@ import time
 from openai import AsyncOpenAI
 import httpx
 
+from app.core.config import settings
+
 logger = logging.getLogger(__name__)
 
-_AIML_BASE_URL = "https://api.aimlapi.com/v1"
-_PARSE_MODEL = "openai/gpt-5-nano-2025-08-07"
-_SECTION_MODEL = "openai/gpt-5-nano-2025-08-07"
-_HOLISTIC_MODEL = "moonshot/kimi-k2-0905-preview"
+# Model IDs are config-driven (see core/config.py) so a provider change or a
+# retired model ID is an env edit, not a code change.
+_AIML_BASE_URL = settings.AIML_BASE_URL
+_PARSE_MODEL = settings.RESUME_PARSE_MODEL
+_SECTION_MODEL = settings.RESUME_SECTION_MODEL
+_HOLISTIC_MODEL = settings.RESUME_HOLISTIC_MODEL
 
 # Per-request timeout for AIML API calls (seconds)
 _API_TIMEOUT = 320.0
@@ -186,17 +190,10 @@ class ResumeAnalyzerService:
             add_usage(resp.usage)
             return json.loads(resp.choices[0].message.content)
         except Exception as e:
+            # Re-raise: a failed parse means the whole analysis must fail loudly
+            # (status=failed) rather than persist an empty resume as "completed".
             logger.error(f"Section parsing failed: {e}")
-            return {
-                "name": "",
-                "contact": {"email": None, "phone": None, "linkedin": None, "location": None},
-                "summary": None,
-                "experience": [],
-                "education": [],
-                "skills": [],
-                "certifications": [],
-                "projects": [],
-            }
+            raise
 
     async def _analyze_one_section(self, section_name: str, content, add_usage) -> dict:
         content_str = json.dumps(content) if not isinstance(content, str) else (content or "")
@@ -227,17 +224,11 @@ class ResumeAnalyzerService:
                 "suggestions": data.get("suggestions", []),
             }
         except Exception as e:
+            # Re-raise so a provider/parse failure fails the whole analysis rather
+            # than silently scoring a section 0. (A legitimately-absent section is
+            # returned by the model as found=false, not raised here.)
             logger.error(f"Section analysis failed for {section_name}: {e}")
-            return {
-                "name": _SECTION_DISPLAY.get(section_name, section_name.capitalize()),
-                "found": False,
-                "score": None,
-                "content_snippet": None,
-                "strengths": [],
-                "weaknesses": [],
-                "tips": [],
-                "suggestions": [],
-            }
+            raise
 
     async def _analyze_sections(self, parsed: dict, add_usage) -> list:
         section_contents = {
@@ -276,15 +267,7 @@ class ResumeAnalyzerService:
             add_usage(resp.usage)
             return json.loads(resp.choices[0].message.content)
         except Exception as e:
+            # Re-raise: without a holistic review there is no meaningful report,
+            # so fail the analysis instead of persisting all-zero scores.
             logger.error(f"Holistic review failed: {e}")
-            return {
-                "overall_score": 0,
-                "quality_score": 0,
-                "summary": "",
-                "strengths": [],
-                "weaknesses": [],
-                "top_tips": [],
-                "lackings": [],
-                "ats": {"score": 0, "keywords_found": [], "keywords_missing": [], "formatting_issues": []},
-                "suggestions": [],
-            }
+            raise

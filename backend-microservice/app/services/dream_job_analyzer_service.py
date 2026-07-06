@@ -15,11 +15,14 @@ import time
 from openai import AsyncOpenAI
 import httpx
 
+from app.core.config import settings
+
 logger = logging.getLogger(__name__)
 
-_AIML_BASE_URL = "https://api.aimlapi.com/v1"
-_NORMALIZE_MODEL = "openai/gpt-5-nano-2025-08-07"
-_FIT_MODEL = "moonshot/kimi-k2-0905-preview"
+# Model IDs are config-driven (see core/config.py).
+_AIML_BASE_URL = settings.AIML_BASE_URL
+_NORMALIZE_MODEL = settings.DREAM_JOB_NORMALIZE_MODEL
+_FIT_MODEL = settings.DREAM_JOB_FIT_MODEL
 
 # Per-request timeout for AIML API calls (seconds)
 _API_TIMEOUT = 320.0
@@ -183,16 +186,10 @@ class DreamJobAnalyzerService:
             add_usage(resp.usage)
             return json.loads(resp.choices[0].message.content)
         except Exception as e:
+            # Re-raise so a provider/parse failure fails the analysis (status=failed)
+            # instead of feeding an empty JD into the fit pass and scoring fit 0.
             logger.error(f"JD normalization failed: {e}")
-            return {
-                "role_title": "",
-                "company": None,
-                "seniority": "",
-                "must_have_skills": [],
-                "nice_to_have_skills": [],
-                "responsibilities": [],
-                "keywords": [],
-            }
+            raise
 
     async def _fit_analysis(
         self,
@@ -241,15 +238,7 @@ class DreamJobAnalyzerService:
             add_usage(resp.usage)
             return json.loads(resp.choices[0].message.content)
         except Exception as e:
+            # Re-raise: without a fit report there is nothing meaningful to show,
+            # so fail the analysis rather than persist a fit_score of 0.
             logger.error(f"Fit analysis failed: {e}")
-            return {
-                "fit_score": 0,
-                "interview_chance": 0,
-                "fit_summary": "",
-                "matching_strengths": [],
-                "gaps": [],
-                "points_to_improve": [],
-                "resume_tailoring_plan": [],
-                "suggested_projects": [],
-                "ats_keyword_coverage": {"matched": [], "missing": []},
-            }
+            raise
