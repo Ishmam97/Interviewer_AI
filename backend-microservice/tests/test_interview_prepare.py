@@ -2,7 +2,7 @@
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from httpx import AsyncClient, ASGITransport
-from app.server import app
+from app.server import app, get_current_user
 
 DUMMY_TOKEN = "test-token"
 AUTH_HEADER = {"Authorization": f"Bearer {DUMMY_TOKEN}"}
@@ -13,7 +13,12 @@ def mock_current_user():
     user = MagicMock()
     user.uid = "test-uid-123"
     user.email = "test@example.com"
-    return user
+    # FastAPI resolves Depends(get_current_user) by object reference captured at
+    # route-definition time, so patching the module attribute does nothing.
+    # dependency_overrides is the supported way to inject a fake user.
+    app.dependency_overrides[get_current_user] = lambda: user
+    yield user
+    app.dependency_overrides.pop(get_current_user, None)
 
 
 @pytest.fixture
@@ -27,8 +32,7 @@ class TestInterviewPrepare:
     @pytest.mark.asyncio
     async def test_prepare_missing_api_key(self, mock_current_user):
         """Should return 500 when GEMINI_API_KEY is not set."""
-        with patch("app.server.get_current_user", return_value=mock_current_user), \
-             patch.dict("os.environ", {}, clear=True):
+        with patch.dict("os.environ", {}, clear=True):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
                 response = await client.post(
                     "/interview/prepare",
@@ -45,8 +49,7 @@ class TestInterviewPrepare:
     async def test_prepare_invalid_file_type(self, mock_current_user):
         """Should return 400 for non-PDF/TXT files."""
         mock_svc = AsyncMock()
-        with patch("app.server.get_current_user", return_value=mock_current_user), \
-             patch.dict("os.environ", {"GEMINI_API_KEY": "fake-key"}), \
+        with patch.dict("os.environ", {"GEMINI_API_KEY": "fake-key"}), \
              patch("app.services.gemini_file_service.GeminiFileService", return_value=mock_svc):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
                 response = await client.post(
@@ -75,8 +78,7 @@ class TestInterviewPrepare:
             {"question": "Why this role?", "category": "motivation"},
         ]
 
-        with patch("app.server.get_current_user", return_value=mock_current_user), \
-             patch.dict("os.environ", {"GEMINI_API_KEY": "fake-key"}), \
+        with patch.dict("os.environ", {"GEMINI_API_KEY": "fake-key"}), \
              patch("app.services.gemini_file_service.GeminiFileService", return_value=mock_svc):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
                 response = await client.post(
@@ -125,8 +127,7 @@ class TestInterviewTypes:
             {"question": "Q1", "category": "general"},
         ]
 
-        with patch("app.server.get_current_user", return_value=mock_current_user), \
-             patch.dict("os.environ", {"GEMINI_API_KEY": "fake-key"}), \
+        with patch.dict("os.environ", {"GEMINI_API_KEY": "fake-key"}), \
              patch("app.services.gemini_file_service.GeminiFileService", return_value=mock_svc):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
                 response = await client.post(
