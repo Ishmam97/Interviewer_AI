@@ -25,20 +25,27 @@ Single API key, single base URL. Configured via `OPENAI_BASE_URL=https://api.aim
 
 Models are referenced with their provider prefix: `openai/gpt-5-nano-2025-08-07`, `moonshot/kimi-k2-0905-preview`. The client is an `AsyncOpenAI` instance pointed at the AIML base URL.
 
-## Where it's used
+## Where it's used — now config-driven (2026-07, see [[Config-driven fail-loud LLM calls]])
 
-| Service | Models |
-|---|---|
-| `resume_analyzer_service.py` | `openai/gpt-5-nano` (parse + sections), `moonshot/kimi-k2` (holistic) |
-| `dream_job_analyzer_service.py` | `openai/gpt-5-nano` (normalize), `moonshot/kimi-k2` (fit analysis) |
-| `interview_system.py` (via langchain) | `gpt-4.1-nano` default, user-configurable |
+Model IDs used to be hardcoded per-service; every one is now a `Settings` field in `core/config.py`, overridable by env var without a code change:
 
-## Timeouts
+| Setting | Default | Used by |
+|---|---|---|
+| `RESUME_PARSE_MODEL` / `RESUME_SECTION_MODEL` | `openai/gpt-5-nano-2025-08-07` | resume analyzer steps 1-2 |
+| `RESUME_HOLISTIC_MODEL` | `moonshot/kimi-k2-0905-preview` | resume analyzer step 3 |
+| `DREAM_JOB_NORMALIZE_MODEL` | `openai/gpt-5-nano-2025-08-07` | Dream Job pass 1 |
+| `DREAM_JOB_FIT_MODEL` | `moonshot/kimi-k2-0905-preview` | Dream Job pass 2 |
+| `SUGGESTION_APPLY_MODEL` | `openai/gpt-4.1-mini-2025-04-14` | suggestion accept + bulk-apply |
 
-Both analyzer services use:
-- Per-call: 320s (httpx timeout on the `AsyncOpenAI` client)
-- Overall analysis: 480s (`asyncio.wait_for`)
+`interview_system.py` (via langchain) still defaults to `DEFAULT_MODEL` = `gpt-4.1-nano-2025-04-14`, user-configurable via `user_settings`.
 
-These are very long — Kimi calls for complex analyses can take 1-3 minutes.
+#gotcha The AIML API key has been disabled at least once in production use (confirmed directly by the project owner). This is exactly the failure mode [[Config-driven fail-loud LLM calls]] was fixed for — a disabled/invalid key must now surface as `status: "failed"`, not a silent zero-score "completed" report. See the production roadmap's risk list — re-provisioning the key is a Phase A owner action.
 
-[[Concepts MOC]] · [[AI Pipeline]] · [[Resume Analysis]] · [[Dream Job]]
+## Timeouts — tightened 2026-07
+
+Both analyzer services now use:
+- Per-call: **60s** (was 320s — the SDK's own retry logic could multiply an already-long wait)
+- Overall analysis: **240s resume / 180s Dream Job** (was 480s for both)
+- `max_retries=2` explicit; `max_tokens` set on every completion call (previously unbounded)
+
+[[Concepts MOC]] · [[AI Pipeline]] · [[Resume Analysis]] · [[Dream Job]] · [[Config-driven fail-loud LLM calls]]

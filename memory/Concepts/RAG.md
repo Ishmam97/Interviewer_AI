@@ -28,6 +28,6 @@ Facebook AI Similarity Search — an in-process vector similarity library. Chose
 
 ## Limitation
 
-FAISS is stored in-memory + on local disk (Docker volume). If the session is reconstructed from Firestore after a pod restart, the FAISS index is gone. RAG silently falls back to empty context.
+FAISS is stored on local disk (Docker volume), now **per-session** (fixed 2026-07 — see [[Session-scoped FAISS index]], which closed a real cross-user data leak from the old shared-path default). There is no session reconstruction at all after a pod restart (no `_reconstruct_session()` exists) — the whole `InterviewSystem` object, FAISS included, is simply gone; `/interview/answer` returns a clean 404 rather than silently degrading.
 
-[[Concepts MOC]] · [[RAG System]] · [[Interview System]]
+[[Concepts MOC]] · [[RAG System]] · [[Interview System]] · [[Session-scoped FAISS index]]
