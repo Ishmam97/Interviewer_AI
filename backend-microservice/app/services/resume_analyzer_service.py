@@ -20,10 +20,18 @@ _PARSE_MODEL = settings.RESUME_PARSE_MODEL
 _SECTION_MODEL = settings.RESUME_SECTION_MODEL
 _HOLISTIC_MODEL = settings.RESUME_HOLISTIC_MODEL
 
-# Per-request timeout for AIML API calls (seconds)
-_API_TIMEOUT = 320.0
-# Overall analysis timeout (seconds)
-_ANALYSIS_TIMEOUT = 480.0
+# Per-request timeout for AIML API calls (seconds). Kept well under
+# _ANALYSIS_TIMEOUT since the SDK's own retry logic (max_retries below) can
+# consume a multiple of this on transient failures.
+_API_TIMEOUT = 60.0
+# Overall analysis timeout (seconds) — parse + sections + holistic run
+# sequentially, so this must comfortably exceed 3x _API_TIMEOUT.
+_ANALYSIS_TIMEOUT = 240.0
+
+# Caps user-supplied resume text before it's embedded in a prompt. A resume
+# this long is already pathological; truncating avoids unbounded token cost
+# from a huge/malformed upload.
+_MAX_RESUME_CHARS = 12000
 
 _SECTIONS = ["contact", "summary", "experience", "education", "skills", "certifications", "projects"]
 
@@ -43,11 +51,19 @@ class ResumeAnalyzerService:
         self._client = AsyncOpenAI(
             api_key=api_key,
             base_url=_AIML_BASE_URL,
+            max_retries=2,
             # Configure httpx timeout to prevent hanging requests
             http_client=httpx.AsyncClient(
-                timeout=httpx.Timeout(_API_TIMEOUT, connect=30.0)
+                timeout=httpx.Timeout(_API_TIMEOUT, connect=10.0)
             ),
         )
+
+    async def aclose(self):
+        """Close the underlying HTTP client. Call once per service instance —
+        each instance owns its own httpx.AsyncClient, which otherwise leaks
+        connections/file descriptors across the many short-lived instances
+        created per background task."""
+        await self._client.close()
 
     # ── Public ──────────────────────────────────────────────────────────────────
 
@@ -179,13 +195,14 @@ class ResumeAnalyzerService:
             '"education": [{"degree": "string", "institution": "string", "year": "string"}], '
             '"skills": ["string"], "certifications": ["string"], '
             '"projects": [{"name": "string", "description": "string"}]}\n\nResume:\n'
-            + resume_text
+            + resume_text[:_MAX_RESUME_CHARS]
         )
         try:
             resp = await self._client.chat.completions.create(
                 model=_PARSE_MODEL,
                 messages=[{"role": "user", "content": prompt}],
                 response_format={"type": "json_object"},
+                max_tokens=2000,
             )
             add_usage(resp.usage)
             return json.loads(resp.choices[0].message.content)
@@ -199,7 +216,7 @@ class ResumeAnalyzerService:
         content_str = json.dumps(content) if not isinstance(content, str) else (content or "")
         prompt = (
             f'Analyze the "{section_name}" section of a resume.\n'
-            f"Section content:\n{content_str}\n\n"
+            f"Section content:\n{content_str[:_MAX_RESUME_CHARS]}\n\n"
             "Return a JSON object with exactly these keys:\n"
             '{"found": true, "score": 0-100, "content_snippet": "first 100 chars or null", '
             '"strengths": ["string"], "weaknesses": ["string"], "tips": ["string"], '
@@ -210,6 +227,7 @@ class ResumeAnalyzerService:
                 model=_SECTION_MODEL,
                 messages=[{"role": "user", "content": prompt}],
                 response_format={"type": "json_object"},
+                max_tokens=800,
             )
             add_usage(resp.usage)
             data = json.loads(resp.choices[0].message.content)
@@ -256,13 +274,14 @@ class ResumeAnalyzerService:
             '"formatting_issues": ["string"]}, '
             '"suggestions": [{"id": "unique_string", "text": "high-level suggestion", '
             '"section": "overall", "status": "pending"}]}\n\nResume:\n'
-            + resume_text
+            + resume_text[:_MAX_RESUME_CHARS]
         )
         try:
             resp = await self._client.chat.completions.create(
                 model=_HOLISTIC_MODEL,
                 messages=[{"role": "user", "content": prompt}],
                 response_format={"type": "json_object"},
+                max_tokens=2000,
             )
             add_usage(resp.usage)
             return json.loads(resp.choices[0].message.content)
