@@ -3,25 +3,13 @@ from langchain_core.documents import Document
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 import os
 
-# Try to import FAISS with fallback to CPU version
-try:
-    from langchain_community.vectorstores import FAISS
-    FAISS_AVAILABLE = True
-    print("✅ FAISS with GPU support loaded")
-except ImportError as e:
-    print(f"⚠️ Failed to load FAISS: {e}")
-    try:
-        # Try to install and import faiss-cpu as fallback
-        import subprocess
-        import sys
-        print("🔄 Attempting to install faiss-cpu as fallback...")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "faiss-cpu"])
-        from langchain_community.vectorstores import FAISS
-        FAISS_AVAILABLE = True
-        print("✅ FAISS CPU fallback installed and loaded")
-    except Exception as fallback_error:
-        print(f"❌ Failed to install faiss-cpu fallback: {fallback_error}")
-        FAISS_AVAILABLE = False
+# faiss-cpu is a hard pin in requirements.txt — a missing import means a
+# broken build/deploy, not something to paper over with a runtime `pip
+# install`. Installing packages at import time can hang (no network egress
+# in some container environments) or silently fail on a read-only filesystem,
+# and risks installing an untested version outside the pinned one.
+from langchain_community.vectorstores import FAISS
+FAISS_AVAILABLE = True
 
 
 class RAGSystem:
