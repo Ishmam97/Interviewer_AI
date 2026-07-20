@@ -35,10 +35,18 @@ logger = logging.getLogger(__name__)
 
 _HTTP_TIMEOUT = 20.0
 _MAX_REDIRECTS = 5
+# Caps the scraped JD text before it's later embedded in an LLM prompt
+# (dream_job_analyzer_service). A hostile/oversized page shouldn't translate
+# into unbounded token cost downstream.
+_MAX_JD_TEXT_CHARS = 15000
 _USER_AGENT = (
     "Mozilla/5.0 (compatible; DreamJobBot/1.0; +https://example.com/bot)"
 )
 _ALLOWED_SCHEMES = {"http", "https"}
+# Reject responses that honestly declare an oversized body before we buffer
+# them into memory. Doesn't stop a server that lies about Content-Length, but
+# guards the common case of a careless huge page cheaply.
+_MAX_RESPONSE_BYTES = 5 * 1024 * 1024
 
 # ── SSRF guard ────────────────────────────────────────────────────────────────
 
@@ -58,12 +66,18 @@ def _is_safe_url(url: str) -> tuple[bool, str]:
         infos = socket.getaddrinfo(host, None)
         for _family, _type, _proto, _canonname, sockaddr in infos:
             ip = ipaddress.ip_address(sockaddr[0])
+            # Unwrap IPv4-mapped IPv6 (e.g. ::ffff:169.254.169.254) so the
+            # checks below see the real embedded IPv4 instead of classifying
+            # the wrapper address, which is not itself private/link-local.
+            mapped = ip.ipv4_mapped if isinstance(ip, ipaddress.IPv6Address) else None
+            check_ip = mapped or ip
             if (
-                ip.is_private
-                or ip.is_loopback
-                or ip.is_link_local
-                or ip.is_reserved
-                or ip.is_multicast
+                check_ip.is_private
+                or check_ip.is_loopback
+                or check_ip.is_link_local
+                or check_ip.is_reserved
+                or check_ip.is_multicast
+                or check_ip.is_unspecified
             ):
                 return False, f"resolves to non-public IP {ip}"
     except (socket.gaierror, ValueError) as exc:
@@ -81,6 +95,9 @@ async def _safe_get(
         if not ok:
             raise ValueError(f"SSRF guard blocked redirect to {url}: {reason}")
         resp = await client.get(url, headers=headers, follow_redirects=False, **kwargs)
+        content_length = resp.headers.get("content-length")
+        if content_length and int(content_length) > _MAX_RESPONSE_BYTES:
+            raise ValueError(f"Response too large ({content_length} bytes) from {url}")
         if resp.is_redirect:
             location = resp.headers.get("location", "")
             if not location:
@@ -123,7 +140,8 @@ def _meta_name(soup: BeautifulSoup, name: str) -> str | None:
 def _visible_text(soup: BeautifulSoup) -> str:
     for tag in soup(["script", "style", "noscript", "header", "footer", "nav"]):
         tag.decompose()
-    return " ".join(soup.get_text(separator=" ").split())
+    text = " ".join(soup.get_text(separator=" ").split())
+    return text[:_MAX_JD_TEXT_CHARS]
 
 
 # ── Source-specific parsers ────────────────────────────────────────────────────
