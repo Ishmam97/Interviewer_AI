@@ -15,6 +15,12 @@ from google.genai import types
 
 CHAT_MODEL = "gemini-2.5-flash"
 
+# Wall-clock cap on a single streamed generation. Without this, a hung
+# upstream stream blocks the turn (and the websocket) indefinitely — the
+# 300s receive timeout below only covers waiting for the candidate's next
+# answer, not generation itself.
+_STREAM_TIMEOUT = 90.0
+
 _SYSTEM_PROMPT = """\
 You are a warm, professional AI interviewer conducting a {interview_type}.
 The candidate's resume and the job description have been provided to you as files.
@@ -157,23 +163,36 @@ class LiveInterviewAgent:
         contents: list,
         websocket: WebSocket,
     ) -> str:
-        """Stream one AI turn to the WebSocket. Returns the full text."""
+        """Stream one AI turn to the WebSocket. Returns the full text.
+
+        Wrapped in a wall-clock timeout so a hung upstream generation can't
+        block the turn — and the whole websocket — indefinitely.
+        """
         full_text = ""
 
-        async for chunk in await self.client.aio.models.generate_content_stream(
-            model=self.model,
-            contents=contents,
-            config=types.GenerateContentConfig(
-                system_instruction=system_instruction,
-            ),
-        ):
-            if chunk.text:
-                full_text += chunk.text
-                await websocket.send_json({
-                    "type": "ai_text",
-                    "text": chunk.text,
-                    "done": False,
-                })
+        async def _consume():
+            nonlocal full_text
+            async for chunk in await self.client.aio.models.generate_content_stream(
+                model=self.model,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                ),
+            ):
+                if chunk.text:
+                    full_text += chunk.text
+                    await websocket.send_json({
+                        "type": "ai_text",
+                        "text": chunk.text,
+                        "done": False,
+                    })
+
+        try:
+            await asyncio.wait_for(_consume(), timeout=_STREAM_TIMEOUT)
+        except asyncio.TimeoutError:
+            print(f"LiveInterviewAgent: generation timed out after {_STREAM_TIMEOUT}s")
+            if not full_text:
+                full_text = "I'm sorry, I'm having trouble responding right now. Let's continue."
 
         await websocket.send_json({"type": "ai_text", "text": "", "done": True})
         return full_text
