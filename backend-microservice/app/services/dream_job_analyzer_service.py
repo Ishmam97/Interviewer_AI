@@ -24,10 +24,17 @@ _AIML_BASE_URL = settings.AIML_BASE_URL
 _NORMALIZE_MODEL = settings.DREAM_JOB_NORMALIZE_MODEL
 _FIT_MODEL = settings.DREAM_JOB_FIT_MODEL
 
-# Per-request timeout for AIML API calls (seconds)
-_API_TIMEOUT = 320.0
-# Overall analysis timeout (seconds)
-_ANALYSIS_TIMEOUT = 480.0
+# Per-request timeout for AIML API calls (seconds). Kept well under
+# _ANALYSIS_TIMEOUT since the SDK's own retry logic (max_retries below) can
+# consume a multiple of this on transient failures.
+_API_TIMEOUT = 60.0
+# Overall analysis timeout (seconds) — two passes run sequentially, so this
+# must comfortably exceed 2x _API_TIMEOUT.
+_ANALYSIS_TIMEOUT = 180.0
+
+# Caps user-supplied text (scraped JD, raw resume) before it's embedded in a
+# prompt, to bound token cost regardless of upload/scrape size.
+_MAX_TEXT_CHARS = 12000
 
 
 class DreamJobAnalyzerService:
@@ -35,11 +42,19 @@ class DreamJobAnalyzerService:
         self._client = AsyncOpenAI(
             api_key=api_key,
             base_url=_AIML_BASE_URL,
+            max_retries=2,
             # Configure httpx timeout to prevent hanging requests
             http_client=httpx.AsyncClient(
-                timeout=httpx.Timeout(_API_TIMEOUT, connect=30.0)
+                timeout=httpx.Timeout(_API_TIMEOUT, connect=10.0)
             ),
         )
+
+    async def aclose(self):
+        """Close the underlying HTTP client — each service instance owns its
+        own httpx.AsyncClient, which otherwise leaks connections/file
+        descriptors across the many short-lived instances created per
+        background task."""
+        await self._client.close()
 
     # ── Public ──────────────────────────────────────────────────────────────────
 
@@ -175,13 +190,14 @@ class DreamJobAnalyzerService:
             '"nice_to_have_skills": ["string"], '
             '"responsibilities": ["string"], '
             '"keywords": ["string"]}\n\n'
-            "Job Description:\n" + jd_text
+            "Job Description:\n" + jd_text[:_MAX_TEXT_CHARS]
         )
         try:
             resp = await self._client.chat.completions.create(
                 model=_NORMALIZE_MODEL,
                 messages=[{"role": "user", "content": prompt}],
                 response_format={"type": "json_object"},
+                max_tokens=1200,
             )
             add_usage(resp.usage)
             return json.loads(resp.choices[0].message.content)
@@ -208,13 +224,13 @@ class DreamJobAnalyzerService:
             "Analyze how well this candidate's resume matches the given job description "
             "and produce a detailed fit report.\n\n"
             "RESUME (parsed sections):\n"
-            + json.dumps(resume_parsed_sections, indent=2)
+            + json.dumps(resume_parsed_sections, indent=2)[:_MAX_TEXT_CHARS]
             + "\n\nRESUME (raw text):\n"
-            + resume_text
+            + resume_text[:_MAX_TEXT_CHARS]
             + "\n\nJOB DESCRIPTION (normalized):\n"
-            + json.dumps(jd_normalized, indent=2)
+            + json.dumps(jd_normalized, indent=2)[:_MAX_TEXT_CHARS]
             + "\n\nJOB DESCRIPTION (raw):\n"
-            + jd_text
+            + jd_text[:_MAX_TEXT_CHARS]
             + "\n\nReturn a JSON object with exactly these keys:\n"
             '{"fit_score": <integer 0-100>, '
             '"interview_chance": <integer 0-100>, '
@@ -234,6 +250,7 @@ class DreamJobAnalyzerService:
                 model=_FIT_MODEL,
                 messages=[{"role": "user", "content": prompt}],
                 response_format={"type": "json_object"},
+                max_tokens=3000,
             )
             add_usage(resp.usage)
             return json.loads(resp.choices[0].message.content)

@@ -2,7 +2,7 @@
 type: codebase-note
 status: active
 created: '2026-06-02'
-updated: '2026-06-02'
+updated: '2026-07-19'
 tags:
   - codebase
   - ai
@@ -11,62 +11,55 @@ tags:
 ---
 # AI Pipeline
 
-The core intelligence of the app. All LLM calls go through an OpenAI-compatible API (AIML API by default, configurable via `OPENAI_BASE_URL`).
+The core intelligence of the app. All LLM calls go through an OpenAI-compatible API (AIML API by default, configurable via `OPENAI_BASE_URL`/`AIML_BASE_URL`) or Gemini directly (live interview).
 
-## LLM configuration
+## LLM configuration — now config-driven (2026-07)
 
-| Setting | Default | Override |
+#gotcha **Fixed bug, keep for context:** model IDs used to be hardcoded string literals scattered across `resume_analyzer_service.py`, `dream_job_analyzer_service.py`, and `server.py`. Now every model ID is a `Settings` field in `core/config.py`, overridable via env var without a code change:
+
+| Setting | Default | Used by |
 |---|---|---|
-| Model | `gpt-4.1-nano-2025-04-14` (interview flow) | `user_settings` Firestore doc |
-| Base URL | `https://api.aimlapi.com/v1` | `OPENAI_BASE_URL` env var |
-| Embeddings | `text-embedding-3-small` | `use_ollama` flag → `granite-embedding:30m` |
-| Dream Job LLM | Kimi (2nd pass) | hardcoded in `dream_job_analyzer_service.py` |
+| `AIML_BASE_URL` | `https://api.aimlapi.com/v1` | all AIML-routed calls |
+| `RESUME_PARSE_MODEL` / `RESUME_SECTION_MODEL` | `openai/gpt-5-nano-2025-08-07` | resume analyzer steps 1–2 |
+| `RESUME_HOLISTIC_MODEL` | `moonshot/kimi-k2-0905-preview` | resume analyzer step 3 |
+| `DREAM_JOB_NORMALIZE_MODEL` | `openai/gpt-5-nano-2025-08-07` | Dream Job pass 1 |
+| `DREAM_JOB_FIT_MODEL` | `moonshot/kimi-k2-0905-preview` | Dream Job pass 2 |
+| `SUGGESTION_APPLY_MODEL` | `openai/gpt-4.1-mini-2025-04-14` | suggestion accept + bulk-apply |
+| `GEMINI_MODEL` | `gemini-2.5-flash` | live interview |
+| `DEFAULT_MODEL` | `gpt-4.1-nano-2025-04-14` | classic LangGraph interview (user-overridable via `user_settings`) |
 
-## Interview pipeline (LangGraph)
+See [[Config-driven fail-loud LLM calls]] for why this changed.
 
-`services/workflow_manager.py` defines a LangGraph state machine:
+## Fail-loud, not silent-default (fixed 2026-07-06 — was CRITICAL)
 
-```
-document_processing → interview_planning → question_generation → answer_analysis → (loop) → report_generation
-```
+#gotcha **Fixed bug, keep for context:** every LLM step in `resume_analyzer_service.py` and `dream_job_analyzer_service.py` used to wrap its call in `try/except Exception` and return a **zero-filled default dict** on any failure (bad JSON, provider 404, expired key). Since the AIML key was disabled at one point during testing, this meant `status: "completed"` reports full of `score: 0` and empty lists — the user saw an empty report with **no error indication at all**. All three resume-analysis steps and both Dream Job passes now **re-raise** on failure instead of swallowing it, so the existing background-task `except` handler correctly flips the Firestore doc to `status: "failed"` with the real error. Regression tests (`test_analyzer_fail_loud.py`) assert a provider error or malformed JSON raises, not returns zeros.
 
-- **document_processing** (`services/document_processor.py`): parse PDF/TXT resume + JD; extract text
-- **interview_planning** (`services/interview_planner.py`): generate question plan (topics, count, difficulty) via LLM
-- **RAG** (`services/rag_system.py`): FAISS index built from resume + JD at session start; top-k chunks retrieved per question for context
-- **question_generation** (`services/interview_system.py`): uses plan + RAG context to generate each question
-- **answer_analysis** (`services/response_analyzer.py`): scores answer 0–10, identifies strengths/weaknesses, suggests improvements
-- **report_generation** (`services/report_generator.py`): synthesizes all Q&A, scores, and analysis into a final report
+## Interview pipeline (LangGraph, classic REST mode)
 
-Report generation is synchronous at interview completion (by design — Cloud Functions compatibility).
+`services/workflow_manager.py` defines a LangGraph state machine (see [[LangGraph Workflow]] for the full graph). Report generation is synchronous at interview completion.
+
+## Live interview pipeline (WebSocket, Gemini) — shipped, not backlog
+
+**Correction to earlier vault state:** this was previously listed as backlog/unclear. It is a real, shipped feature: `POST /interview/prepare` (uploads resume+JD to Gemini File API, generates a question plan) → `WS /ws/interview/{session_id}` (streaming conversational Q&A via `LiveInterviewAgent`). See [[Live Interview]].
 
 ## FAISS vector store
 
-- Index built at interview start from uploaded documents
-- Persisted to `./vector_stores/interview_faiss_index` (Docker volume)
-- Survives container restarts via volume mount
-- #gotcha If the session is reconstructed from Firestore (e.g. after pod restart), FAISS is NOT available — RAG falls back to no-context mode silently
+Now **per-session**, not a single shared path — see [[RAG System]] for the cross-user-leak fix.
 
 ## Resume analysis pipeline
 
-3-step async, launched as BackgroundTask on resume upload:
-
-1. **parsing_document** — gpt-5-nano extracts structured JSON (name, contact, summary, experience, education, skills, certs, projects)
-2. **analyzing_sections** — 7 parallel LLM calls, one per section; each returns `score`, `strengths`, `weaknesses`, `tips`, `suggestions[]`
-3. **holistic_review** — cross-section assessment, overall score, top 3 improvements
-
-Each suggestion: `{ id: unique_string, text: string, status: "pending" }`. User accepts/rejects; accepted suggestions trigger an AI resume edit (diff applied to stored resume text).
+3-step async, launched as `BackgroundTask` on resume upload — see [[Resume Analysis]] for the full step-by-step and the suggestion-persistence model.
 
 ## Dream Job pipeline
 
-2-pass async pipeline in `services/dream_job_analyzer_service.py`:
+2-pass async pipeline — see [[Dream Job]]. Both passes now cap embedded user text (~12-15K chars) and set `max_tokens` explicitly (added 2026-07, cost hardening).
 
-1. **normalizing** — `gpt-5-nano` parses JD into structured fields (role, company, required skills, nice-to-haves, etc.)
-2. **analyzing** — Kimi LLM performs fit analysis against resume, returns fit_score, interview_chance, matching_strengths, gaps, points_to_improve, resume_tailoring_plan, suggested_projects, ats_keyword_coverage
+## Cost/timeout hardening (added 2026-07)
 
-Frontend polls `GET /dream-job/{id}/status` every 2s during analysis.
+Per-call timeouts tightened 320s→60s (they were pathologically long, and the SDK's own retry logic could multiply the wait); overall analysis timeouts tightened 480s→240s (resume) / 180s (Dream Job); `max_retries=2` explicit on every `AsyncOpenAI` client; `max_tokens` set on every completion call (previously unbounded); each analyzer service's `httpx.AsyncClient` is now explicitly closed via `aclose()` in the background-task `finally` block (was leaking a connection per analysis run). `max_questions` bounded 1–20 on both interview-creation routes.
 
 ## Prompts
 
 All LLM prompts live in `backend-microservice/app/utils/prompts.py`. Centralised — change one file to adjust behaviour across the pipeline.
 
-[[Codebase Map]] · [[Backend]] · [[Dream Job]]
+[[Codebase Map]] · [[Backend]] · [[Dream Job]] · [[Live Interview]] · [[Resume Analysis]]

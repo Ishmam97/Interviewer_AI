@@ -9,6 +9,7 @@ import os
 import tempfile
 import time
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -21,6 +22,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from openai import AsyncOpenAI
 from pydantic import BaseModel
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
 from app.core.config import settings
 from app.database.firebase_db import FirebaseManager
@@ -33,11 +37,71 @@ logging.basicConfig(
 
 # ── App ───────────────────────────────────────────────────────────────────────
 
+# BackgroundTasks run in-process; a restart/crash mid-analysis leaves the
+# Firestore doc stuck `processing`/`normalizing` forever with no error surfaced
+# to the client. This threshold must stay comfortably above both services'
+# _ANALYSIS_TIMEOUT (480s) so it never sweeps a legitimately-running analysis.
+_STALE_ANALYSIS_THRESHOLD_SECONDS = 600
+_SWEEP_INTERVAL_SECONDS = 300
+
+
+def _sweep_stale_analyses_sync():
+    fb = get_firebase_manager()
+    resume_swept = fb.sweep_stale_resume_analyses(_STALE_ANALYSIS_THRESHOLD_SECONDS)
+    dream_job_swept = fb.sweep_stale_dream_jobs(_STALE_ANALYSIS_THRESHOLD_SECONDS)
+    if resume_swept or dream_job_swept:
+        logger.warning(
+            f"[StaleSweep] Marked {resume_swept} stale resume analyses and "
+            f"{dream_job_swept} stale dream jobs as failed."
+        )
+
+
+async def _sweep_stale_analyses_once():
+    try:
+        # FirebaseManager's calls are synchronous network I/O. Running them
+        # directly on the event loop — even from a "fire and forget"
+        # asyncio.create_task — still freezes every other coroutine (including
+        # the /health handler) for as long as Firestore takes to respond.
+        # asyncio.to_thread is what actually makes this non-blocking.
+        await asyncio.to_thread(_sweep_stale_analyses_sync)
+    except Exception as e:
+        logger.error(f"[StaleSweep] Sweep failed: {e}")
+
+
+async def _periodic_sweep_loop():
+    while True:
+        await asyncio.sleep(_SWEEP_INTERVAL_SECONDS)
+        await _sweep_stale_analyses_once()
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    # Fire-and-forget, not awaited: readiness (Cloud Run's startup probe hits
+    # /health) must never block on Firestore being reachable. A slow/failed
+    # sweep only delays failing out stale docs, which is already tolerated for
+    # up to _SWEEP_INTERVAL_SECONDS during normal operation.
+    asyncio.create_task(_sweep_stale_analyses_once())
+    sweep_task = asyncio.create_task(_periodic_sweep_loop())
+    try:
+        yield
+    finally:
+        sweep_task.cancel()
+        try:
+            await sweep_task
+        except asyncio.CancelledError:
+            pass
+
+
+_is_production = settings.ENVIRONMENT == "production"
+
 app = FastAPI(
     title="AI Interview Assistant",
     version=settings.VERSION,
-    docs_url="/docs",
-    redoc_url="/redoc",
+    # Interactive API docs leak route/schema details and are unauthenticated —
+    # keep them for dev/staging but drop them in production.
+    docs_url=None if _is_production else "/docs",
+    redoc_url=None if _is_production else "/redoc",
+    lifespan=_lifespan,
 )
 
 app.add_middleware(
@@ -47,6 +111,25 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _rate_limit_key(request: Request) -> str:
+    """Rate-limit key: the raw bearer token when present, so a single
+    authenticated session gets its own bucket regardless of shared IPs
+    (offices, mobile carriers, VPNs). Falls back to remote IP for the
+    pre-auth routes (signup/signin)."""
+    auth = request.headers.get("authorization", "")
+    if auth.lower().startswith("bearer "):
+        return auth[7:]
+    return get_remote_address(request)
+
+
+# Disabled under the test harness — TestClient reuses the same dummy bearer
+# token across many calls within a single test run, which would otherwise
+# make tests flaky against real limits.
+limiter = Limiter(key_func=_rate_limit_key, enabled=(settings.ENVIRONMENT != "test"))
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 
 @app.middleware("http")
@@ -210,6 +293,19 @@ async def _validate_upload(upload: UploadFile, field: str, max_bytes: int = 10 *
     filename = (upload.filename or "").lower()
     if not (filename.endswith(".pdf") or filename.endswith(".txt")):
         raise HTTPException(status_code=400, detail=f"{field} must be a PDF or TXT file")
+    # Filename extensions are client-supplied and trivially spoofed — sniff
+    # actual content so a renamed binary/executable can't ride a .pdf/.txt
+    # extension into the PDF loader or the LLM pipeline.
+    if filename.endswith(".pdf"):
+        if not content.startswith(b"%PDF-"):
+            raise HTTPException(status_code=400, detail=f"{field} is not a valid PDF file")
+    else:
+        try:
+            content.decode("utf-8")
+        except UnicodeDecodeError:
+            raise HTTPException(status_code=400, detail=f"{field} is not a valid text file")
+        if b"\x00" in content:
+            raise HTTPException(status_code=400, detail=f"{field} is not a valid text file")
     return content
 
 def _create_interview_system(
@@ -292,7 +388,8 @@ async def admin_health_check():
 # ── Auth endpoints ────────────────────────────────────────────────────────────
 
 @app.post("/auth/signup")
-async def signup(credentials: UserCredentials):
+@limiter.limit("10/minute")
+async def signup(request: Request, credentials: UserCredentials):
     fb = get_firebase_manager()
     result = fb.sign_up(credentials.email, credentials.password, credentials.full_name or "")
     if not result.get("success"):
@@ -319,7 +416,8 @@ async def signup(credentials: UserCredentials):
 
 
 @app.post("/auth/signin")
-async def signin(credentials: UserCredentials):
+@limiter.limit("10/minute")
+async def signin(request: Request, credentials: UserCredentials):
     fb = get_firebase_manager()
     result = fb.sign_in(credentials.email, credentials.password)
     if not result.get("success"):
@@ -441,8 +539,8 @@ async def _run_resume_analysis_bg(uid: str, resume_text: str, filename: str, ana
     from app.services.resume_analyzer_service import ResumeAnalyzerService, _ANALYSIS_TIMEOUT
     fb = get_firebase_manager()
     logger.info(f"[resume_analysis:{analysis_id}] Background task started for user {uid}, file='{filename}'")
+    svc = ResumeAnalyzerService(api_key=settings.OPENAI_API_KEY)
     try:
-        svc = ResumeAnalyzerService(api_key=settings.OPENAI_API_KEY)
         analysis = await asyncio.wait_for(
             svc.analyze(resume_text, filename, analysis_id=analysis_id, fb=fb),
             timeout=_ANALYSIS_TIMEOUT,
@@ -475,10 +573,16 @@ async def _run_resume_analysis_bg(uid: str, resume_text: str, filename: str, ana
             "status": "failed",
             "current_step": "failed",
         })
+    finally:
+        # Each ResumeAnalyzerService owns its own httpx.AsyncClient — close it
+        # here or connections/file descriptors leak across every analysis run.
+        await svc.aclose()
 
 
 @app.post("/profile/resume")
+@limiter.limit("10/minute")
 async def upload_resume(
+    request: Request,
     background_tasks: BackgroundTasks,
     resume: UploadFile = File(...),
     current_user=Depends(get_current_user),
@@ -502,7 +606,11 @@ async def upload_resume(
 
         analysis_id = str(uuid.uuid4())
         fb = get_firebase_manager()
-        fb.create_resume_analysis(uid, analysis_id, resume.filename)
+        if not fb.create_resume_analysis(uid, analysis_id, resume.filename):
+            # Don't enqueue a background task against a doc that doesn't exist —
+            # every later update_resume_analysis() call would silently no-op and
+            # the client would poll a 404 forever.
+            raise HTTPException(status_code=500, detail="Failed to start resume analysis")
 
         background_tasks.add_task(_run_resume_analysis_bg, uid, resume_text, resume.filename, analysis_id)
 
@@ -609,7 +717,7 @@ async def update_suggestion(
     applied_changes = None
     if request.action == "accept" and matched_suggestion:
         applied_changes = await _apply_suggestion_to_resume(
-            fb, uid, suggestion_id, matched_suggestion.get("text", ""), section_name
+            fb, uid, analysis_id, suggestion_id, matched_suggestion.get("text", ""), section_name
         )
 
     result = {
@@ -623,56 +731,51 @@ async def update_suggestion(
     return result
 
 
+# Caps the resume JSON embedded in the suggestion-apply prompt so an
+# unusually large resume can't drive unbounded token cost.
+_MAX_SUGGESTION_CONTEXT_CHARS = 12000
+
+
 async def _apply_suggestion_to_resume(
     fb: FirebaseManager,
     user_id: str,
+    analysis_id: str,
     suggestion_id: str,
     suggestion_text: str,
     section_name: str,
 ) -> Optional[dict]:
-    """Use the LLM to apply an accepted suggestion to the user's edited_resume_data.
+    """Use the LLM to apply an accepted suggestion to working_parsed_sections.
 
-    Saves a snapshot before applying so the change can be undone.
+    working_parsed_sections (resume_parsed_sections/{analysis_id}) is the
+    single source of truth for session edits — the same store the bulk-apply
+    and Dream Job fit-analysis paths already read from. Saves a snapshot
+    before applying so the change can be undone.
     Returns a dict describing what was changed, or None if nothing could be applied.
     """
-    logger.info(f"[ApplySuggestion] Starting: user={user_id}, suggestion={suggestion_id}, section={section_name}")
+    logger.info(f"[ApplySuggestion] Starting: user={user_id}, analysis={analysis_id}, suggestion={suggestion_id}, section={section_name}")
 
-    # Get current edited_resume_data from profile (or parsed_sections from analysis)
-    profile = fb.get_user_profile(user_id)
-    if not profile:
-        logger.warning(f"[ApplySuggestion] No profile found for user {user_id}")
+    fb.ensure_working_parsed_sections(analysis_id)
+    parsed_doc = fb.get_resume_parsed_doc(analysis_id)
+    if not parsed_doc:
+        logger.warning(f"[ApplySuggestion] No resume_parsed_sections doc for analysis {analysis_id}")
         return None
 
-    edited_data = profile.get("edited_resume_data")
-    if not edited_data:
-        logger.info(f"[ApplySuggestion] No edited_resume_data in profile, falling back to parsed_sections")
-        # Fall back to parsed_sections — stored in a separate collection
-        analysis_id = profile.get("current_analysis_id")
-        if not analysis_id:
-            logger.warning(f"[ApplySuggestion] No current_analysis_id in profile for user {user_id}")
-            return None
-        # parsed_sections lives in resume_parsed_sections/{analysis_id}, not in the analysis doc
-        parsed_doc = fb.db.collection("resume_parsed_sections").document(analysis_id).get()
-        if parsed_doc.exists:
-            parsed_data = parsed_doc.to_dict()
-            edited_data = parsed_data.get("parsed_sections", {})
-            if edited_data:
-                logger.info(f"[ApplySuggestion] Loaded parsed_sections from resume_parsed_sections/{analysis_id} (keys: {list(edited_data.keys())})")
-        if not edited_data:
-            logger.warning(f"[ApplySuggestion] No parsed_sections found for analysis {analysis_id}")
-            return None
-    else:
-        logger.info(f"[ApplySuggestion] Using edited_resume_data from profile (keys: {list(edited_data.keys())})")
+    working = parsed_doc.get("working_parsed_sections") or parsed_doc.get("parsed_sections") or {}
+    if not working:
+        logger.warning(f"[ApplySuggestion] No working parsed sections for analysis {analysis_id}")
+        return None
 
-    # Save a snapshot of the current state for undo
-    snapshot_ref = fb.db.collection("suggestion_snapshots").document(f"{user_id}:{suggestion_id}")
-    snapshot_ref.set({
+    # Save a snapshot of the current state for undo. Session-scoped key
+    # (uid:analysis_id:suggestion_id) so re-analyzing a resume never collides
+    # with a stale snapshot from a previous analysis of the same suggestion id.
+    snapshot_key = f"{user_id}:{analysis_id}:{suggestion_id}"
+    fb.db.collection("suggestion_snapshots").document(snapshot_key).set({
         "user_id": user_id,
         "suggestion_id": suggestion_id,
-        "snapshot_data": edited_data,
+        "snapshot_data": working,
         "created_at": datetime.now().isoformat(),
     })
-    logger.info(f"[ApplySuggestion] Snapshot saved for {user_id}:{suggestion_id}")
+    logger.info(f"[ApplySuggestion] Snapshot saved for {snapshot_key}")
 
     # Get the API key to use for the LLM call
     api_key = settings.OPENAI_API_KEY
@@ -684,7 +787,7 @@ async def _apply_suggestion_to_resume(
 
     section_context = ""
     if section_name and section_name != "overall":
-        section_data = edited_data.get(section_name)
+        section_data = working.get(section_name)
         if section_data is not None:
             section_context = json.dumps({section_name: section_data}, indent=2, ensure_ascii=False)
         else:
@@ -695,10 +798,10 @@ async def _apply_suggestion_to_resume(
                 "projects": "projects",
             }
             key = display_map.get(section_name)
-            if key and key in edited_data:
-                section_context = json.dumps({key: edited_data[key]}, indent=2, ensure_ascii=False)
+            if key and key in working:
+                section_context = json.dumps({key: working[key]}, indent=2, ensure_ascii=False)
 
-    full_context = json.dumps(edited_data, indent=2, ensure_ascii=False)
+    full_context = json.dumps(working, indent=2, ensure_ascii=False)[:_MAX_SUGGESTION_CONTEXT_CHARS]
 
     prompt = (
         f"You are editing a resume based on an accepted suggestion.\n\n"
@@ -720,6 +823,7 @@ async def _apply_suggestion_to_resume(
             model=llm_model,
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"},
+            max_tokens=4000,
         )
         usage = response.usage
         logger.info(
@@ -732,9 +836,8 @@ async def _apply_suggestion_to_resume(
         updated_data = json.loads(response.choices[0].message.content)
         logger.info(f"[ApplySuggestion] Parsed updated resume JSON (keys: {list(updated_data.keys())})")
 
-        # Save back to the profile
-        fb.update_user_profile_full(user_id, {"edited_resume_data": updated_data})
-        logger.info(f"[ApplySuggestion] Saved updated resume to profile.edited_resume_data")
+        fb.set_working_parsed_sections(analysis_id, user_id, updated_data)
+        logger.info(f"[ApplySuggestion] Saved updated resume to working_parsed_sections/{analysis_id}")
 
         # Return a summary of what changed
         changes = {"section": section_name or "overall", "suggestion_applied": suggestion_text}
@@ -811,7 +914,7 @@ async def _apply_bulk_suggestions_to_section(
     numbered_suggestions = "\n".join(
         f"{i + 1}. {item['text']}" for i, item in enumerate(suggestion_items)
     )
-    section_json = json.dumps({resolved_key: section_data}, indent=2, ensure_ascii=False)
+    section_json = json.dumps({resolved_key: section_data}, indent=2, ensure_ascii=False)[:_MAX_SUGGESTION_CONTEXT_CHARS]
 
     prompt = (
         f"You are a professional resume editor. "
@@ -832,6 +935,7 @@ async def _apply_bulk_suggestions_to_section(
             model=llm_model,
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"},
+            max_tokens=3000,
         )
         usage = response.usage
         logger.info(
@@ -867,26 +971,26 @@ async def _apply_bulk_suggestions_to_section(
 def _restore_suggestion_snapshot(
     fb: FirebaseManager,
     user_id: str,
+    analysis_id: str,
     suggestion_id: str,
 ) -> Optional[dict]:
-    """Restore the edited_resume_data from the snapshot saved before accepting a suggestion.
+    """Restore working_parsed_sections from the snapshot saved before accepting a suggestion.
 
     Returns the restored data, or None if no snapshot exists.
     """
-    snapshot_id = f"{user_id}:{suggestion_id}"
+    snapshot_id = f"{user_id}:{analysis_id}:{suggestion_id}"
     snapshot_doc = fb.db.collection("suggestion_snapshots").document(snapshot_id).get()
 
     if not snapshot_doc.exists:
-        logger.warning(f"No snapshot found for suggestion {suggestion_id}, user {user_id}")
+        logger.warning(f"No snapshot found for {snapshot_id}")
         return None
 
     snapshot_data = snapshot_doc.to_dict().get("snapshot_data")
     if not snapshot_data:
-        logger.warning(f"Snapshot for {suggestion_id} has no data")
+        logger.warning(f"Snapshot for {snapshot_id} has no data")
         return None
 
-    # Restore the snapshot as the current edited_resume_data
-    fb.update_user_profile_full(user_id, {"edited_resume_data": snapshot_data})
+    fb.set_working_parsed_sections(analysis_id, user_id, snapshot_data)
 
     # Delete the snapshot so it can't be undone again
     fb.db.collection("suggestion_snapshots").document(snapshot_id).delete()
@@ -936,7 +1040,7 @@ async def undo_suggestion(
         raise HTTPException(status_code=400, detail="Suggestion has not been accepted — nothing to undo.")
 
     # Restore the pre-accept state
-    restored = _restore_suggestion_snapshot(fb, uid, suggestion_id)
+    restored = _restore_suggestion_snapshot(fb, uid, analysis_id, suggestion_id)
     if not restored:
         raise HTTPException(status_code=404, detail="No undo snapshot found. Changes may have already been overwritten.")
 
@@ -1112,10 +1216,12 @@ async def update_settings(request: SettingsUpdateRequest, current_user=Depends(g
 # ── Legacy REST interview (LangGraph) ─────────────────────────────────────────
 
 @app.post("/interview/start", response_model=InterviewResponse)
+@limiter.limit("10/minute")
 async def start_interview(
+    request: Request,
     resume: UploadFile = File(...),
     job_description: UploadFile = File(...),
-    max_questions: int = Form(3),
+    max_questions: int = Form(3, ge=1, le=20),
     model_name: str = Form("gemini-2.5-flash"),
     temperature: float = Form(0.3),
     current_user=Depends(get_current_user),
@@ -1159,7 +1265,21 @@ async def start_interview(
         with tempfile.NamedTemporaryFile(delete=False, suffix=".txt") as f:
             f.write(job_bytes); job_path = f.name
 
-        config = InterviewConfig(max_questions=max_questions, model_name=effective_model, temperature=temperature)
+        # Generate the session_id up front so the FAISS index gets a
+        # session-scoped path. Without this, every interview shares the same
+        # default index_path — a later session's setup_rag_system() can load
+        # a PREVIOUS session's (possibly a different user's) stale index
+        # instead of rebuilding, leaking that user's resume/JD into this RAG
+        # context. A fresh per-session path guarantees load_existing_index()
+        # never hits an unrelated session's file.
+        session_id = str(uuid.uuid4())
+        index_path = os.path.join(settings.VECTOR_STORE_PATH, f"interview_{session_id}")
+        config = InterviewConfig(
+            max_questions=max_questions,
+            model_name=effective_model,
+            temperature=temperature,
+            index_path=index_path,
+        )
         system = _create_interview_system(
             api_key=resolved_key,
             config=config,
@@ -1168,9 +1288,13 @@ async def start_interview(
             system_api_key=system_api_key,
             system_base_url=system_base_url,
         )
-        interview_state = system.start_interactive_interview(resume_path, job_path)
+        # start_interactive_interview does synchronous file I/O + embedding +
+        # LLM calls — run it off the event loop so it doesn't block every
+        # other in-flight request for the duration of setup.
+        interview_state = await asyncio.to_thread(
+            system.start_interactive_interview, resume_path, job_path
+        )
 
-        session_id = str(uuid.uuid4())
         _active_sessions[session_id] = {
             "interview_system": system,
             "interview_state": interview_state,
@@ -1194,14 +1318,24 @@ async def start_interview(
 
 
 @app.post("/interview/answer", response_model=AnalysisResponse)
-async def submit_answer(request: AnswerRequest, current_user=Depends(get_current_user)):
-    if request.session_id not in _active_sessions:
-        raise HTTPException(status_code=404, detail="Session not found")
-    session = _active_sessions[request.session_id]
+@limiter.limit("20/minute")
+async def submit_answer(request: Request, payload: AnswerRequest, current_user=Depends(get_current_user)):
+    if payload.session_id not in _active_sessions:
+        # Sessions live only in this process's memory (no reconstruction) — a
+        # restart or a request landing on a different instance loses them.
+        # This message tells the candidate to restart rather than looking like
+        # a generic bug.
+        raise HTTPException(
+            status_code=404,
+            detail="Interview session not found or expired. Please start a new interview.",
+        )
+    session = _active_sessions[payload.session_id]
     system = session["interview_system"]
     state = session["interview_state"]
 
-    updated = system.process_candidate_answer(state, request.answer)
+    # process_candidate_answer does synchronous LLM + FAISS calls — offload so
+    # it doesn't block every other in-flight request for its duration.
+    updated = await asyncio.to_thread(system.process_candidate_answer, state, payload.answer)
     session["interview_state"] = updated
 
     note = updated.get("interview_notes", [])[-1] if updated.get("interview_notes") else {}
@@ -1214,10 +1348,10 @@ async def submit_answer(request: AnswerRequest, current_user=Depends(get_current
 
     next_question = None
     if not is_complete:
-        next_question = system.get_next_question(updated)
+        next_question = await asyncio.to_thread(system.get_next_question, updated)
 
     return AnalysisResponse(
-        session_id=request.session_id,
+        session_id=payload.session_id,
         score=score,
         analysis=analysis,
         is_complete=is_complete,
@@ -1302,7 +1436,8 @@ async def get_interview_report(session_id: str, current_user=Depends(get_current
 # ── Resume Analyzer ───────────────────────────────────────────────────────────
 
 @app.post("/analyze/resume")
-async def analyze_resume(resume: UploadFile = File(...), current_user=Depends(get_current_user)):
+@limiter.limit("10/minute")
+async def analyze_resume(request: Request, resume: UploadFile = File(...), current_user=Depends(get_current_user)):
     resume_path = None
     try:
         resume_bytes = await _validate_upload(resume, "resume")
@@ -1329,11 +1464,13 @@ async def analyze_resume(resume: UploadFile = File(...), current_user=Depends(ge
 # ── Live Interview — Gemini File API + streaming chat ─────────────────────────
 
 @app.post("/interview/prepare")
+@limiter.limit("10/minute")
 async def prepare_live_interview(
+    request: Request,
     resume: UploadFile = File(...),
     job_description: UploadFile = File(...),
     interview_type: str = Form("Job Interview"),
-    max_questions: int = Form(5),
+    max_questions: int = Form(5, ge=1, le=20),
     current_user=Depends(get_current_user),
 ):
     from app.services.gemini_file_service import GeminiFileService
@@ -1594,6 +1731,7 @@ async def _run_dream_job_analysis_bg(
         f"[dream_job_analysis:{dream_job_id}] Background task started for user {uid}"
     )
 
+    svc = None
     try:
         fb.update_dream_job(dream_job_id, {"status": "normalizing", "current_step": "starting"})
 
@@ -1660,16 +1798,23 @@ async def _run_dream_job_analysis_bg(
             "current_step": "failed",
             "error": str(e),
         })
+    finally:
+        # Each DreamJobAnalyzerService owns its own httpx.AsyncClient — close it
+        # here or connections/file descriptors leak across every analysis run.
+        if svc is not None:
+            await svc.aclose()
 
 
 @app.post("/dream-job/from-link")
+@limiter.limit("10/minute")
 async def dream_job_from_link(
-    request: DreamJobFromLinkRequest,
+    request: Request,
+    payload: DreamJobFromLinkRequest,
     current_user=Depends(get_current_user),
 ):
     """Fetch a job posting URL and return prefill data for the dream-job form."""
     from app.services import job_link_parser as _jlp
-    result = await _jlp.parse_job_url(request.url)
+    result = await _jlp.parse_job_url(payload.url)
 
     if result.get("error") == "url_rejected":
         raise HTTPException(status_code=400, detail="URL rejected: not a public job posting URL")
@@ -1688,8 +1833,10 @@ async def dream_job_from_link(
 
 
 @app.post("/dream-job")
+@limiter.limit("10/minute")
 async def create_dream_job(
-    request: DreamJobCreateRequest,
+    request: Request,
+    payload: DreamJobCreateRequest,
     background_tasks: BackgroundTasks,
     current_user=Depends(get_current_user),
 ):
@@ -1698,7 +1845,7 @@ async def create_dream_job(
     fb = get_firebase_manager()
 
     # Verify resume_analysis_id belongs to this user
-    resume_doc = fb.get_resume_analysis_by_id(request.resume_analysis_id)
+    resume_doc = fb.get_resume_analysis_by_id(payload.resume_analysis_id)
     if not resume_doc:
         raise HTTPException(status_code=404, detail="Resume analysis not found")
     if resume_doc.get("user_id") != uid:
@@ -1713,12 +1860,12 @@ async def create_dream_job(
     if not fb.create_dream_job(
         uid=uid,
         dream_job_id=dream_job_id,
-        company=request.company,
-        role_title=request.role_title,
-        jd_text=request.jd_text,
-        source=request.source,
-        source_url=request.source_url,
-        resume_analysis_id=request.resume_analysis_id,
+        company=payload.company,
+        role_title=payload.role_title,
+        jd_text=payload.jd_text,
+        source=payload.source,
+        source_url=payload.source_url,
+        resume_analysis_id=payload.resume_analysis_id,
     ):
         raise HTTPException(status_code=500, detail="Failed to create dream job record")
 
@@ -1726,8 +1873,8 @@ async def create_dream_job(
         _run_dream_job_analysis_bg,
         uid,
         dream_job_id,
-        request.jd_text,
-        request.resume_analysis_id,
+        payload.jd_text,
+        payload.resume_analysis_id,
     )
 
     return {"dream_job_id": dream_job_id, "status": "pending"}

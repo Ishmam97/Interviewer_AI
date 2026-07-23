@@ -47,6 +47,8 @@ def _make_firebase_mock():
         "total_reports": 0,
     }
     fb.test_connection.return_value = {"success": True}
+    fb.sweep_stale_resume_analyses.return_value = 0
+    fb.sweep_stale_dream_jobs.return_value = 0
     fb.get_user_profile.return_value = {
         "uid": "test-uid-123",
         "email": "test@example.com",

@@ -1,8 +1,10 @@
 # FastAPI and API dependencies
 fastapi==0.115.6
 uvicorn[standard]==0.32.1
-python-multipart==0.0.6
-python-jose[cryptography]==3.3.0
+# 0.0.6 has CVE-2024-24762 (ReDoS on multipart/form-data parsing, on the
+# request path for every file upload) — bumped to the fixed version.
+python-multipart==0.0.9
+slowapi==0.1.10
 
 # Scraping
 beautifulsoup4==4.13.4

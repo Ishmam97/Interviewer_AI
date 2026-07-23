@@ -37,6 +37,12 @@ RUN mkdir -p /app/logs \
     && mkdir -p /app/data/job_descriptions \
     && mkdir -p /app/vector_stores/interview_faiss_index
 
+# Run as a non-root user — the process only needs write access to its own
+# runtime-state directories, not root on the container.
+RUN groupadd -r appuser && useradd -r -g appuser appuser \
+    && chown -R appuser:appuser /app
+USER appuser
+
 # Expose port
 EXPOSE 8000
 

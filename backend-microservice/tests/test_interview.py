@@ -171,6 +171,46 @@ class TestInterviewStart:
             )
         assert r.status_code == 401
 
+    def test_start_uses_session_scoped_faiss_index_path(self):
+        """Regression: every interview must get its own FAISS index_path.
+
+        Before this fix, InterviewConfig.index_path defaulted to a single
+        shared path, so a later session's setup_rag_system() could silently
+        load a PREVIOUS (possibly different user's) session's index instead
+        of rebuilding — leaking that user's resume/JD into this RAG context.
+        """
+        fb = _make_firebase_mock()
+
+        configs_seen = []
+
+        def _capture_config(**kwargs):
+            configs_seen.append(kwargs["config"])
+            return _mock_interview_system()
+
+        with patch("app.server._create_interview_system", side_effect=_capture_config):
+            with authed_client(fb) as c:
+                r1 = c.post(
+                    "/interview/start",
+                    data={"max_questions": "2"},
+                    files=make_upload_files(),
+                )
+                r2 = c.post(
+                    "/interview/start",
+                    data={"max_questions": "2"},
+                    files=make_upload_files(),
+                )
+
+        assert r1.status_code == 200 and r2.status_code == 200
+        session_id_1 = r1.json()["session_id"]
+        session_id_2 = r2.json()["session_id"]
+        assert session_id_1 != session_id_2
+
+        assert len(configs_seen) == 2
+        path_1, path_2 = configs_seen[0].index_path, configs_seen[1].index_path
+        assert path_1 != path_2
+        assert session_id_1 in path_1
+        assert session_id_2 in path_2
+
     def test_start_missing_files(self, client):
         r = client.post("/interview/start", data={"max_questions": "2"})
         assert r.status_code == 422
@@ -207,7 +247,45 @@ class TestInterviewAnswer:
             "answer": "My answer",
         })
         assert r.status_code == 404
+        assert "expired" in r.json()["detail"].lower()
 
     def test_answer_missing_fields(self, client):
         r = client.post("/interview/answer", json={"session_id": "abc"})
         assert r.status_code == 422
+
+    def test_answer_success_offloads_blocking_calls(self, client):
+        """process_candidate_answer / get_next_question run synchronous LLM+FAISS
+        calls; they must be invoked via asyncio.to_thread rather than directly
+        on the event loop. A MagicMock works identically either way, so this
+        also verifies the happy path still returns the right shape."""
+        from app.server import _active_sessions
+
+        mock_sys = MagicMock()
+        mock_sys.process_candidate_answer.return_value = {
+            "interview_notes": [{"score": 8, "analysis": "Good answer"}],
+            "current_question_idx": 1,
+            "interview_plan": [{"question": "Q1"}, {"question": "Q2"}],
+        }
+        mock_sys.get_next_question.return_value = "Q2"
+
+        _active_sessions["test-session-1"] = {
+            "interview_system": mock_sys,
+            "interview_state": {"current_question_idx": 0, "interview_plan": []},
+            "user_id": "test-uid-123",
+            "created_at": "2026-01-01T00:00:00",
+        }
+        try:
+            r = client.post("/interview/answer", json={
+                "session_id": "test-session-1",
+                "answer": "My answer",
+            })
+        finally:
+            _active_sessions.pop("test-session-1", None)
+
+        assert r.status_code == 200
+        body = r.json()
+        assert body["score"] == 8
+        assert body["is_complete"] is False
+        assert body["next_question"] == "Q2"
+        mock_sys.process_candidate_answer.assert_called_once()
+        mock_sys.get_next_question.assert_called_once()

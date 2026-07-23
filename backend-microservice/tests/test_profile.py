@@ -71,3 +71,15 @@ class TestProfile:
             files={"resume": ("resume.txt", b"", "text/plain")},
         )
         assert r.status_code == 400
+
+    def test_upload_resume_create_analysis_failure_returns_500(self, client, firebase_mock):
+        """If create_resume_analysis fails, the route must not enqueue a background
+        task against a doc that doesn't exist — the client would then poll a
+        status that 404s forever with no way to recover."""
+        firebase_mock.create_resume_analysis.return_value = False
+        r = client.post(
+            "/profile/resume",
+            files={"resume": ("resume.txt", b"Some resume content", "text/plain")},
+        )
+        assert r.status_code == 500
+        firebase_mock.update_resume_analysis.assert_not_called()

@@ -928,6 +928,70 @@ class FirebaseManager:
             logger.error(f"Error fetching resume analysis {analysis_id}: {e}")
             return None
 
+    def sweep_stale_resume_analyses(self, max_age_seconds: int) -> int:
+        """Fail out resume_analyses docs stuck in `processing` past max_age_seconds.
+
+        BackgroundTasks run in-process and are lost if the process restarts or is
+        killed mid-analysis, leaving the Firestore doc `processing` forever with
+        no error and no way for the client to recover. This is a defensive sweep
+        run at startup (to clean up crash leftovers from a previous process) and
+        periodically thereafter. Returns the number of docs marked failed.
+        """
+        cutoff = datetime.now() - timedelta(seconds=max_age_seconds)
+        swept = 0
+        try:
+            query = self.db.collection("resume_analyses").where(
+                filter=FieldFilter("status", "==", "processing")
+            )
+            for doc in query.stream():
+                data = doc.to_dict()
+                stamp = data.get("updated_at") or data.get("created_at")
+                try:
+                    ts = datetime.fromisoformat(stamp) if stamp else None
+                except (TypeError, ValueError):
+                    ts = None
+                if ts is None or ts < cutoff:
+                    doc.reference.update({
+                        "status": "failed",
+                        "current_step": "failed",
+                        "error": "Analysis did not complete (server restarted or timed out).",
+                        "updated_at": datetime.now().isoformat(),
+                    })
+                    swept += 1
+        except Exception as e:
+            logger.error(f"Error sweeping stale resume analyses: {e}")
+        return swept
+
+    def sweep_stale_dream_jobs(self, max_age_seconds: int) -> int:
+        """Fail out dream_jobs docs stuck in a non-terminal status past max_age_seconds.
+
+        Mirrors sweep_stale_resume_analyses — see that docstring for rationale.
+        """
+        cutoff = datetime.now() - timedelta(seconds=max_age_seconds)
+        swept = 0
+        try:
+            query = self.db.collection("dream_jobs").where(
+                filter=FieldFilter("status", "in", ["pending", "normalizing", "analyzing"])
+            )
+            for doc in query.stream():
+                data = doc.to_dict()
+                stamp = data.get("updated_at") or data.get("created_at")
+                try:
+                    ts = datetime.fromisoformat(stamp) if stamp else None
+                except (TypeError, ValueError):
+                    ts = None
+                if ts is None or ts < cutoff:
+                    doc.reference.update({
+                        "status": "failed",
+                        "current_step": "failed",
+                        "error": "Analysis did not complete (server restarted or timed out).",
+                        "updated_at": datetime.now().isoformat(),
+                    })
+                    swept += 1
+        except Exception as e:
+            logger.error(f"Error sweeping stale dream jobs: {e}")
+        return swept
+
     def get_latest_resume_analysis(self, user_id: str) -> Optional[Dict[str, Any]]:
         """Fetch the most recent resume_analyses doc for a user."""
         try:

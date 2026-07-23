@@ -26,6 +26,7 @@ Location: `frontend/` (git submodule tracked from the parent repo).
 | `App.tsx` | React Router setup — only root + 404 |
 | `services/api.js` | `ApiService` singleton — all backend REST calls with Firebase ID token attached |
 | `lib/firebase.ts` | Firebase client SDK config |
+| `components/LandingPage.tsx` | New (2026-07) marketing landing page shown to signed-out users, replacing the old inline auth screen in `Index.tsx`. Uses a teal-400/slate-950 palette — **different** from the blue/purple palette every logged-in screen still uses. This split-brain is scoped for unification in [[Production Roadmap]] Phase B. |
 | `components/AuthForm.tsx` | Email/password + Google OAuth sign-in/sign-up |
 | `components/Dashboard.tsx` | Session history list + "View Report" action |
 | `components/InterviewInterface.tsx` | Live Q&A: question display, answer input, score feedback |
@@ -66,8 +67,16 @@ Tests live in `frontend/src/__tests__/`. Current coverage: `api.test.ts` (ApiSer
 
 - No URL-based routing makes deep-linking impossible and browser history unusable.
 - `api.js` is plain JavaScript (not TypeScript) — no type safety on API responses.
-- Polling intervals (2s for Dream Job, resume analysis) are hardcoded — no exponential backoff.
+- Polling intervals (2s for Dream Job, resume analysis) are hardcoded — no exponential backoff. **Bounded since 2026-07-19** though (see below) — no longer *unbounded*, just still fixed-interval.
 - No global error boundary (ErrorBoundary component exists but not wired to App-level).
-- Test coverage is thin — mostly the Dream Job addition.
+- Test coverage grew substantially in the 2026-07 hardening sprint (37→43 frontend tests) but is still thinnest outside Dream Job/API.
+- Three clashing color palettes ship today (teal/slate landing page, blue/purple everywhere else, purple/pink on Dream Job) — see [[Production Roadmap]] Phase B, deferred by owner request.
 
-[[Codebase Map]] · [[Backend]] · [[Dream Job]]
+## Reliability fixes (2026-07-19)
+
+- **`api.js` global 401 handler:** `handleResponse` now clears the token and dispatches an `auth:unauthorized` `window` event on any 401 (previously each call just threw a generic error and the dead token kept getting resent). `Index.tsx` listens and bounces the user back to sign-in. Errors now also carry `.status` so callers can distinguish, e.g., a genuine 404 "no resume yet" from a real backend failure.
+- **DreamJobLanding's status poll used to never terminate on error** — any persistent failure hammered the backend every 2s forever with the user stuck on the spinner. Now bounded: 5 consecutive errors or 150 total attempts (5 min) trips a visible error state.
+- **Index.tsx / ResumeManager.tsx's resume-analysis polls** used to stop silently on the *first* transient error, freezing the UI at "processing" forever with no explanation. Now tolerate a run of errors before giving up, and surface a toast when they do.
+- Removed a duplicate `deleteInterviewSession` method in `api.js` (byte-identical twin, harmless but dead).
+
+[[Codebase Map]] · [[Backend]] · [[Dream Job]] · [[Auth Flow]] · [[Production Roadmap]]

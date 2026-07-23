@@ -2,16 +2,17 @@
 type: codebase-note
 status: active
 created: '2026-06-02'
-updated: '2026-06-02'
+updated: '2026-07-19'
 tags:
   - codebase
   - rag
   - faiss
   - embeddings
+  - security
 ---
 # RAG System
 
-`services/rag_system.py` — `RAGSystem` class. Wraps a FAISS vector store for retrieval-augmented generation during interviews.
+`services/rag_system.py` — `RAGSystem` class. Wraps a FAISS vector store for retrieval-augmented generation during classic (LangGraph) interviews.
 
 ## How it works
 
@@ -19,15 +20,17 @@ tags:
 2. For each candidate answer, `_retrieve_context()` runs `similarity_search(question + answer, k=3)`
 3. The top 3 matching chunks are concatenated into `rag_context` and injected into the `ResponseAnalyzer` prompt
 
-## Index lifecycle
+## Index lifecycle — now per-session (fixed 2026-07, was a cross-user data leak)
+
+#gotcha **Fixed bug, keep for context:** `InterviewConfig.index_path` used to default to a single shared path (`./interview_faiss_index`) for every session. `setup_rag_system()`'s `load_existing_index()` would silently load whatever index was already on disk if `force_rebuild` wasn't set — meaning **user B's interview could be scored against RAG context built from user A's resume**, since the FAISS file wasn't session-scoped. Fixed by generating the `session_id` *before* constructing `InterviewConfig` in `/interview/start`, then setting `index_path = os.path.join(settings.VECTOR_STORE_PATH, f"interview_{session_id}")` (`server.py` ~1276). Each session now gets a fresh, unique path, so `load_existing_index()` correctly finds nothing and always rebuilds — no cross-user leak is possible by construction. Verified via a regression test asserting two sequential `/interview/start` calls get distinct `index_path` values containing their own `session_id`.
 
 | Event | What happens |
 |---|---|
-| Session start (no existing index) | `FAISS.from_documents(splits, embedding)` → `save_local(index_path)` |
-| Session start (index exists) | `FAISS.load_local(index_path)` + re-load document content (no re-embedding) |
-| Pod restart / cache miss | Index is NOT available — `_reconstruct_session()` from Firestore doesn't restore FAISS |
+| Session start | Fresh per-session `vector_stores/interview_{session_id}/` — `FAISS.from_documents(splits, embedding)` → `save_local(index_path)` |
+| Any later session | Different `session_id` → different path → always rebuilds, never loads another session's index |
+| Pod restart / process loss | The `InterviewSystem` object (LLM clients, RAG) is gone from `_active_sessions` entirely — there's no reconstruction path at all (see [[Backend]]), so this is moot for FAISS specifically |
 
-Index path: `./vector_stores/interview_faiss_index` (Docker volume mount, survives container restarts but not pod-to-pod migrations).
+Leftover per-session index directories under `vector_stores/` are **not cleaned up** after a session ends — a known, documented gap (disk growth over time), tracked in the production roadmap but not yet fixed.
 
 ## Document processing
 
@@ -44,14 +47,14 @@ Index path: `./vector_stores/interview_faiss_index` (Docker volume mount, surviv
 | `"gemini"` | `models/gemini-embedding-2-preview` |
 | `"anthropic"` | Falls back to system key → `text-embedding-3-small` via AIML API |
 
-## FAISS availability
+## FAISS availability — import hardened (2026-07)
 
-`rag_system.py` tries `faiss-gpu` first, then auto-installs `faiss-cpu` as a fallback. If neither works, `RAGSystem.__init__` raises `ImportError`. In practice, containers ship with `faiss-cpu` in `requirements.txt`.
+#gotcha **Fixed:** `rag_system.py` used to `try: import faiss` then, on `ImportError`, run `subprocess.check_call([sys.executable, "-m", "pip", "install", "faiss-cpu"])` at **module import time** — a blocking network install that could hang startup (no egress in some containers) or silently fail on a read-only filesystem, and risked installing an untested version outside the `faiss-cpu==1.11.0` pin in `requirements.txt`. Simplified to a plain top-level `from langchain_community.vectorstores import FAISS` — `faiss-cpu` is a hard dependency; a missing import is now a build/deploy bug that fails loudly, not something papered over at runtime.
 
-#gotcha `allow_dangerous_deserialization=True` is set on `FAISS.load_local()`. This is required by langchain-community but means the index file is trusted. The index is written by the same process so this is acceptable, but it's a security note worth remembering if index files are ever shared or received externally.
+`allow_dangerous_deserialization=True` is still set on `FAISS.load_local()` (required by langchain-community). Acceptable since the index is written by the same process, but worth remembering if index files are ever shared or received externally.
 
 ## Context fallback
 
 If FAISS similarity search fails (exception), `_retrieve_context` sets `rag_context = ""` and continues. The analyzer receives no context, which degrades answer quality but doesn't crash the interview.
 
-[[Codebase Map]] · [[Interview System]] · [[LangGraph Workflow]]
+[[Codebase Map]] · [[Interview System]] · [[LangGraph Workflow]] · [[Session-scoped FAISS index]]

@@ -41,7 +41,12 @@ class Settings(BaseSettings):
     @property
     def cors_origins(self) -> List[str]:
         extras = [o.strip() for o in self.CORS_ALLOWED_ORIGINS.split(",") if o.strip()]
-        return list(dict.fromkeys(self.ALLOWED_ORIGINS + extras))
+        base = self.ALLOWED_ORIGINS
+        if self.ENVIRONMENT == "production":
+            # Don't ship localhost origins in a production CORS allow-list —
+            # they're never a legitimate caller of a deployed API.
+            base = [o for o in base if "localhost" not in o]
+        return list(dict.fromkeys(base + extras))
 
     # Firebase
     FIREBASE_SERVICE_ACCOUNT_PATH: str = os.getenv(

@@ -52,3 +52,23 @@ async def test_oversized_file_raises_413():
         await _validate_upload(_make_upload("resume.txt", big), "resume")
     assert exc.value.status_code == 413
     assert "10 mb" in exc.value.detail.lower()
+
+
+async def test_pdf_extension_with_non_pdf_content_rejected():
+    """A renamed binary/executable riding a spoofed .pdf extension must be
+    rejected by content sniffing, not just the filename check."""
+    from app.server import _validate_upload
+    with pytest.raises(HTTPException) as exc:
+        await _validate_upload(_make_upload("resume.pdf", b"MZ\x90\x00this is not a pdf"), "resume")
+    assert exc.value.status_code == 400
+    assert "not a valid pdf" in exc.value.detail.lower()
+
+
+async def test_txt_extension_with_binary_content_rejected():
+    """A binary file riding a spoofed .txt extension must be rejected —
+    it would otherwise be decoded as text and fed straight into an LLM."""
+    from app.server import _validate_upload
+    with pytest.raises(HTTPException) as exc:
+        await _validate_upload(_make_upload("resume.txt", b"\x00\x01\x02\xff\xfe"), "resume")
+    assert exc.value.status_code == 400
+    assert "not a valid text" in exc.value.detail.lower()
