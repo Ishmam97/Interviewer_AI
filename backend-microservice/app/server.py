@@ -1621,6 +1621,10 @@ async def live_interview_websocket(websocket: WebSocket, session_id: str):
 
     except Exception as exc:
         logger.error(f"Post-interview analysis failed: {exc}")
+        try:
+            await websocket.send_json({"type": "error", "message": "We couldn't generate your interview report. Please try again."})
+        except Exception:
+            pass
 
     finally:
         _live_sessions.pop(session_id, None)
