@@ -342,7 +342,7 @@ class TestListDreamJobs:
         assert len(data["dream_jobs"]) == 1
         assert data["dream_jobs"][0]["company"] == "Acme Corp"
         assert data["dream_jobs"][0]["fit_score"] == 82
-        fb.list_user_dream_jobs.assert_called_once_with(FAKE_UID)
+        fb.list_user_dream_jobs.assert_called_once_with(FAKE_UID, 50, start_after=None)
 
     def test_list_dream_jobs_empty(self):
         """Returns empty list when user has no dream jobs."""
