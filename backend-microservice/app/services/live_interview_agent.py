@@ -21,6 +21,28 @@ CHAT_MODEL = "gemini-2.5-flash"
 # answer, not generation itself.
 _STREAM_TIMEOUT = 90.0
 
+# Cap on how many Content entries (after the opening turn) get resent to
+# Gemini each turn. `contents` grows by one entry every turn; resending the
+# whole thing verbatim makes per-request token cost — and therefore cost —
+# grow quadratically with interview length. 8 entries is ~4 candidate/
+# interviewer exchanges of recent context, which is enough for coherent
+# follow-ups without re-billing the entire interview each turn.
+_MAX_HISTORY_TURNS = 8
+
+
+def _trim_history(contents: list) -> list:
+    """Bound what gets resent to Gemini for a single turn.
+
+    Always keeps `contents[0]` — it carries the resume/JD file parts the
+    model needs to stay grounded — plus only the most recent
+    `_MAX_HISTORY_TURNS` entries, dropping older middle turns. Returns a new
+    list; never mutates `contents` (the caller keeps appending to the full
+    history for the turn protocol/transcript).
+    """
+    if len(contents) <= _MAX_HISTORY_TURNS + 1:
+        return contents
+    return [contents[0]] + contents[-_MAX_HISTORY_TURNS:]
+
 _SYSTEM_PROMPT = """\
 You are a warm, professional AI interviewer conducting a {interview_type}.
 The candidate's resume and the job description have been provided to you as files.
@@ -169,12 +191,13 @@ class LiveInterviewAgent:
         block the turn — and the whole websocket — indefinitely.
         """
         full_text = ""
+        trimmed_contents = _trim_history(contents)
 
         async def _consume():
             nonlocal full_text
             async for chunk in await self.client.aio.models.generate_content_stream(
                 model=self.model,
-                contents=contents,
+                contents=trimmed_contents,
                 config=types.GenerateContentConfig(
                     system_instruction=system_instruction,
                 ),
