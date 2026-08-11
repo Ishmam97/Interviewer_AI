@@ -185,3 +185,6 @@ tmp/
 firebase-service-account.json
 *-service-account.json
 service-account*.json
+
+# Frontend is now a standalone peer repo (Ishmam97/reflect-interview-prep), cloned alongside — not tracked here.
+frontend/

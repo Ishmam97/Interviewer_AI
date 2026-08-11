@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 from fastapi.testclient import TestClient
 
 # ── Minimal env so pydantic-settings doesn't blow up ──────────────────────────
+os.environ.setdefault("OPENAI_API_KEY", "test-key")
 os.environ.setdefault("GEMINI_API_KEY", "test-key")
 os.environ.setdefault("FIREBASE_API_KEY", "test-firebase-key")
 os.environ.setdefault("FIREBASE_PROJECT_ID", "test-project")

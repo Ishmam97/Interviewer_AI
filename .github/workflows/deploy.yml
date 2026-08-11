@@ -8,11 +8,14 @@ on:
 #   GCP_PROJECT_ID          — Google Cloud project ID
 #   GCP_REGION              — e.g. us-central1
 #   GCP_SERVICE_ACCOUNT_KEY — JSON key for a service account with roles:
-#                             Cloud Run Admin, Storage Admin, Artifact Registry Writer
+#                             Cloud Run Admin, Storage Admin, Artifact Registry Writer,
+#                             Secret Manager Secret Accessor
+#
+# Required Secret Manager secrets (owner must create these in GCP before this
+# workflow can deploy successfully — `--set-secrets` below only references them):
+#   OPENAI_API_KEY
 #   GEMINI_API_KEY
 #   FIREBASE_API_KEY
-#   FIREBASE_PROJECT_ID
-#   VITE_FIREBASE_API_KEY (+ other VITE_FIREBASE_* vars)
 
 jobs:
   deploy-backend:
@@ -41,6 +44,7 @@ jobs:
           docker push $IMAGE
 
       - name: Deploy to Cloud Run
+        id: deploy
         env:
           IMAGE: ${{ secrets.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/interviewer/backend:${{ github.sha }}
         run: |
@@ -52,50 +56,13 @@ jobs:
             --port 8000 \
             --memory 1Gi \
             --cpu 1 \
-            --min-instances 0 \
-            --max-instances 10 \
-            --set-env-vars ENVIRONMENT=production \
-            --set-env-vars GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }} \
-            --set-env-vars FIREBASE_API_KEY=${{ secrets.FIREBASE_API_KEY }} \
-            --set-env-vars FIREBASE_PROJECT_ID=${{ secrets.FIREBASE_PROJECT_ID }} \
-            --set-env-vars CORS_ALLOWED_ORIGINS=https://interviewerai-ias.web.app,https://interviewerai-ias.firebaseapp.com
+            --timeout=1800 \
+            --min-instances=1 \
+            --max-instances=1 \
+            --set-secrets=OPENAI_API_KEY=OPENAI_API_KEY:latest,GEMINI_API_KEY=GEMINI_API_KEY:latest,FIREBASE_API_KEY=FIREBASE_API_KEY:latest \
+            --set-env-vars="^;^OPENAI_BASE_URL=https://api.aimlapi.com/v1;ENVIRONMENT=production;FIREBASE_PROJECT_ID=${{ secrets.GCP_PROJECT_ID }};CORS_ALLOWED_ORIGINS=https://interviewerai-ias.web.app,https://interviewerai-ias.firebaseapp.com" \
+            --format='value(status.url)' > service_url.txt
+          echo "url=$(cat service_url.txt)" >> "$GITHUB_OUTPUT"
 
-  deploy-frontend:
-    name: Deploy frontend → Firebase Hosting
-    runs-on: ubuntu-latest
-    needs: deploy-backend
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
-
-      - run: npm ci
-        working-directory: frontend
-
-      - name: Build
-        working-directory: frontend
-        env:
-          VITE_API_BASE_URL: https://interviewer-backend-${{ secrets.GCP_PROJECT_ID }}.a.run.app
-          VITE_WS_BASE_URL: wss://interviewer-backend-${{ secrets.GCP_PROJECT_ID }}.a.run.app
-          VITE_FIREBASE_API_KEY: ${{ secrets.VITE_FIREBASE_API_KEY }}
-          VITE_FIREBASE_AUTH_DOMAIN: ${{ secrets.VITE_FIREBASE_AUTH_DOMAIN }}
-          VITE_FIREBASE_PROJECT_ID: ${{ secrets.VITE_FIREBASE_PROJECT_ID }}
-          VITE_FIREBASE_STORAGE_BUCKET: ${{ secrets.VITE_FIREBASE_STORAGE_BUCKET }}
-          VITE_FIREBASE_MESSAGING_SENDER_ID: ${{ secrets.VITE_FIREBASE_MESSAGING_SENDER_ID }}
-          VITE_FIREBASE_APP_ID: ${{ secrets.VITE_FIREBASE_APP_ID }}
-          VITE_FIREBASE_MEASUREMENT_ID: ${{ secrets.VITE_FIREBASE_MEASUREMENT_ID }}
-        run: npm run build
-
-      - name: Deploy to Firebase Hosting
-        uses: FirebaseExtended/action-hosting-deploy@v0
-        with:
-          repoToken: ${{ secrets.GITHUB_TOKEN }}
-          firebaseServiceAccount: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
-          channelId: live
-          projectId: ${{ secrets.FIREBASE_PROJECT_ID }}
-          entryPoint: frontend
+      - name: Show deployed URL
+        run: echo "Deployed to ${{ steps.deploy.outputs.url }}"
