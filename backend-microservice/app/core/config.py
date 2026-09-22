@@ -20,11 +20,6 @@ class Settings(BaseSettings):
     HOST: str = os.getenv("HOST", "0.0.0.0")
     PORT: int = int(os.getenv("PORT", "8000"))
 
-    # Security
-    SECRET_KEY: str = os.getenv("SECRET_KEY", "your-secret-key-here")
-    ALGORITHM: str = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
-
     # CORS — base list; extend at runtime via CORS_ALLOWED_ORIGINS (comma-separated)
     ALLOWED_ORIGINS: List[str] = [
         "http://localhost:3000",
