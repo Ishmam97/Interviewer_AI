@@ -19,6 +19,7 @@ from fastapi import (
     UploadFile, WebSocket, WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from openai import AsyncOpenAI
 from pydantic import BaseModel
@@ -94,6 +95,29 @@ async def _lifespan(app: FastAPI):
 
 _is_production = settings.ENVIRONMENT == "production"
 
+# ── Observability ─────────────────────────────────────────────────────────────
+# Opt-in: with no SENTRY_DSN set, nothing is initialised and nothing is sent,
+# so dev runs and CI stay offline. A missing sentry_sdk must never take the
+# app down — observability is not on the request path.
+_sentry_enabled = False
+if settings.SENTRY_DSN:
+    try:
+        import sentry_sdk
+
+        sentry_sdk.init(
+            dsn=settings.SENTRY_DSN,
+            environment=settings.ENVIRONMENT,
+            traces_sample_rate=settings.SENTRY_TRACES_SAMPLE_RATE,
+            # Interview answers, resumes and job descriptions are user content;
+            # never attach request bodies or PII to an event.
+            send_default_pii=False,
+        )
+        _sentry_enabled = True
+        logger.info("Sentry initialised for environment=%s", settings.ENVIRONMENT)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.error("Sentry init failed, continuing without it: %s", exc)
+
+
 app = FastAPI(
     title="AI Interview Assistant",
     version=settings.VERSION,
@@ -130,6 +154,33 @@ def _rate_limit_key(request: Request) -> str:
 limiter = Limiter(key_func=_rate_limit_key, enabled=(settings.ENVIRONMENT != "test"))
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    """Catch-all for unhandled exceptions.
+
+    Without this, an unexpected exception returns a bare ASGI 500 with no log
+    line carrying the traceback and no Sentry event — the failure is invisible.
+    The response body is deliberately generic: exception text can contain
+    resume content, prompts or provider error detail that must not reach a
+    client. `HTTPException` is unaffected; FastAPI handles it before this.
+    """
+    logger.error(
+        "Unhandled exception on %s %s", request.method, request.url.path, exc_info=exc
+    )
+    if _sentry_enabled:
+        try:
+            import sentry_sdk
+
+            sentry_sdk.capture_exception(exc)
+        except Exception:  # pragma: no cover - defensive
+            pass
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error. Please try again."},
+    )
+
 
 
 @app.middleware("http")

@@ -6,6 +6,9 @@ uvicorn[standard]==0.32.1
 python-multipart==0.0.9
 slowapi==0.1.10
 
+# Observability — opt-in via SENTRY_DSN; no-op when unset.
+sentry-sdk[fastapi]==2.68.0
+
 # Scraping
 beautifulsoup4==4.13.4
 

@@ -85,6 +85,11 @@ class Settings(BaseSettings):
         "INDEX_PATH", "./vector_stores/interview_faiss_index"
     )
 
+    # Observability — Sentry is opt-in: with no DSN set, init is skipped
+    # entirely so local/dev runs and CI never phone home.
+    SENTRY_DSN: str = os.getenv("SENTRY_DSN", "")
+    SENTRY_TRACES_SAMPLE_RATE: float = float(os.getenv("SENTRY_TRACES_SAMPLE_RATE", "0.0"))
+
     # Logging
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
     LOG_DIR: str = os.getenv("LOG_DIR", "./logs")
