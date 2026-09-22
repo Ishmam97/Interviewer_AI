@@ -20,11 +20,6 @@ class Settings(BaseSettings):
     HOST: str = os.getenv("HOST", "0.0.0.0")
     PORT: int = int(os.getenv("PORT", "8000"))
 
-    # Security
-    SECRET_KEY: str = os.getenv("SECRET_KEY", "your-secret-key-here")
-    ALGORITHM: str = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
-
     # CORS — base list; extend at runtime via CORS_ALLOWED_ORIGINS (comma-separated)
     ALLOWED_ORIGINS: List[str] = [
         "http://localhost:3000",
@@ -72,6 +67,10 @@ class Settings(BaseSettings):
     DREAM_JOB_FIT_MODEL: str = os.getenv("DREAM_JOB_FIT_MODEL", "moonshot/kimi-k2-0905-preview")
     SUGGESTION_APPLY_MODEL: str = os.getenv("SUGGESTION_APPLY_MODEL", "openai/gpt-4.1-mini-2025-04-14")
 
+    # Live interview (WebSocket) — concurrency cap per user. /ws/* is outside
+    # slowapi's reach, so this is the only limit on concurrent Gemini streams.
+    MAX_LIVE_WS_PER_USER: int = int(os.getenv("MAX_LIVE_WS_PER_USER", "2"))
+
     # Interview Configuration
     MAX_QUESTIONS: int = int(os.getenv("MAX_QUESTIONS", "5"))
     CHUNK_SIZE: int = int(os.getenv("CHUNK_SIZE", "800"))
@@ -89,6 +88,11 @@ class Settings(BaseSettings):
     INDEX_PATH: str = os.getenv(
         "INDEX_PATH", "./vector_stores/interview_faiss_index"
     )
+
+    # Observability — Sentry is opt-in: with no DSN set, init is skipped
+    # entirely so local/dev runs and CI never phone home.
+    SENTRY_DSN: str = os.getenv("SENTRY_DSN", "")
+    SENTRY_TRACES_SAMPLE_RATE: float = float(os.getenv("SENTRY_TRACES_SAMPLE_RATE", "0.0"))
 
     # Logging
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")

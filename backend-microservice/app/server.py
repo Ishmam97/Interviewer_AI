@@ -19,6 +19,7 @@ from fastapi import (
     UploadFile, WebSocket, WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from openai import AsyncOpenAI
 from pydantic import BaseModel
@@ -94,6 +95,29 @@ async def _lifespan(app: FastAPI):
 
 _is_production = settings.ENVIRONMENT == "production"
 
+# ── Observability ─────────────────────────────────────────────────────────────
+# Opt-in: with no SENTRY_DSN set, nothing is initialised and nothing is sent,
+# so dev runs and CI stay offline. A missing sentry_sdk must never take the
+# app down — observability is not on the request path.
+_sentry_enabled = False
+if settings.SENTRY_DSN:
+    try:
+        import sentry_sdk
+
+        sentry_sdk.init(
+            dsn=settings.SENTRY_DSN,
+            environment=settings.ENVIRONMENT,
+            traces_sample_rate=settings.SENTRY_TRACES_SAMPLE_RATE,
+            # Interview answers, resumes and job descriptions are user content;
+            # never attach request bodies or PII to an event.
+            send_default_pii=False,
+        )
+        _sentry_enabled = True
+        logger.info("Sentry initialised for environment=%s", settings.ENVIRONMENT)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.error("Sentry init failed, continuing without it: %s", exc)
+
+
 app = FastAPI(
     title="AI Interview Assistant",
     version=settings.VERSION,
@@ -130,6 +154,33 @@ def _rate_limit_key(request: Request) -> str:
 limiter = Limiter(key_func=_rate_limit_key, enabled=(settings.ENVIRONMENT != "test"))
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    """Catch-all for unhandled exceptions.
+
+    Without this, an unexpected exception returns a bare ASGI 500 with no log
+    line carrying the traceback and no Sentry event — the failure is invisible.
+    The response body is deliberately generic: exception text can contain
+    resume content, prompts or provider error detail that must not reach a
+    client. `HTTPException` is unaffected; FastAPI handles it before this.
+    """
+    logger.error(
+        "Unhandled exception on %s %s", request.method, request.url.path, exc_info=exc
+    )
+    if _sentry_enabled:
+        try:
+            import sentry_sdk
+
+            sentry_sdk.capture_exception(exc)
+        except Exception:  # pragma: no cover - defensive
+            pass
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error. Please try again."},
+    )
+
 
 
 @app.middleware("http")
@@ -280,6 +331,14 @@ class AnalysisResponse(BaseModel):
 
 _active_sessions: Dict[str, Any] = {}   # LangGraph sessions (legacy REST flow)
 _live_sessions: Dict[str, Any] = {}     # Gemini File API sessions (live WS flow)
+
+# Live-WS connection registries. /ws/* is not covered by slowapi (it is an
+# HTTP-request limiter), so without these a client can open unlimited sockets
+# — the only unmetered path to Gemini spend in the app. In-memory is correct
+# here: deploy is pinned to one instance (see ADR 0001), and the sockets these
+# track are by definition local to this process.
+_ws_active_sessions: set = set()          # session_ids with a live socket
+_ws_user_connections: Dict[str, int] = {} # uid -> open socket count
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -618,8 +677,10 @@ async def upload_resume(
     except HTTPException:
         raise
     except Exception as e:
+        # The full traceback goes to the logs; `e` here can contain provider
+        # error text or resume content, so it must not reach the client.
         import traceback; logger.error(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"Failed to process resume: {e}")
+        raise HTTPException(status_code=500, detail="Failed to process resume. Please try again.")
     finally:
         if resume_path:
             try: os.unlink(resume_path)
@@ -1547,7 +1608,14 @@ async def live_interview_websocket(websocket: WebSocket, session_id: str):
             return
         uid = decoded.get("uid") or decoded.get("user_id")
     except Exception as exc:
-        await websocket.send_json({"type": "error", "message": f"Auth failed: {exc}"})
+        # The exception can carry Firebase/token internals — log it, send the
+        # client a message it can act on. Also covers the receive_json timeout,
+        # where the client simply never sent its auth frame.
+        logger.warning("Live-interview WS auth failed: %s", exc)
+        await websocket.send_json({
+            "type": "error",
+            "message": "Authentication failed. Please sign in again.",
+        })
         await websocket.close()
         return
 
@@ -1563,75 +1631,107 @@ async def live_interview_websocket(websocket: WebSocket, session_id: str):
         await websocket.close()
         return
 
-    await websocket.send_json({"type": "authenticated"})
-    await websocket.send_json({
-        "type": "ready",
-        "session_id": session_id,
-        "question_count": len(session["question_plan"]),
-        "interview_type": session["interview_type"],
-    })
-
-    api_key = os.getenv("GEMINI_API_KEY")
-
-    agent = LiveInterviewAgent(api_key=api_key)
-    transcript = await agent.run(
-        websocket=websocket,
-        session_id=session_id,
-        question_plan=session["question_plan"],
-        interview_type=session["interview_type"],
-        resume_file_uri=session["resume_file_uri"],
-        resume_mime_type=session["resume_mime_type"],
-        jd_file_uri=session["jd_file_uri"],
-        jd_mime_type=session["jd_mime_type"],
-    )
-
-    if not transcript:
-        logger.warning("Interview ended with empty transcript — skipping analysis.")
-        _live_sessions.pop(session_id, None)
+    # Cap concurrent live sockets before any Gemini work starts. Two sockets on
+    # one session would drive the same interview twice and bill twice; an
+    # unbounded socket count per user is the one LLM-cost path with no limiter
+    # in front of it.
+    if session_id in _ws_active_sessions:
+        await websocket.send_json({
+            "type": "error",
+            "message": "This interview is already open in another tab or window.",
+        })
+        await websocket.close()
         return
 
-    # Post-interview: analyze + save
+    if _ws_user_connections.get(uid, 0) >= settings.MAX_LIVE_WS_PER_USER:
+        await websocket.send_json({
+            "type": "error",
+            "message": "Too many live interviews open at once. Close one and try again.",
+        })
+        await websocket.close()
+        return
+
+    _ws_active_sessions.add(session_id)
+    _ws_user_connections[uid] = _ws_user_connections.get(uid, 0) + 1
+
     try:
-        svc = GeminiFileService(api_key=api_key, model=settings.GEMINI_MODEL)
+        await websocket.send_json({"type": "authenticated"})
+        await websocket.send_json({
+            "type": "ready",
+            "session_id": session_id,
+            "question_count": len(session["question_plan"]),
+            "interview_type": session["interview_type"],
+        })
 
-        class _FakeFile:
-            def __init__(self, uri, mime):
-                self.uri = uri
-                self.mime_type = mime
+        api_key = os.getenv("GEMINI_API_KEY")
 
-        report_data = await svc.analyze_transcript(
-            transcript=transcript,
-            resume_file=_FakeFile(session["resume_file_uri"], session["resume_mime_type"]),
-            jd_file=_FakeFile(session["jd_file_uri"], session["jd_mime_type"]),
-        )
-
-        fb = get_firebase_manager()
-        fb.create_interview_session(
-            user_id=uid,
+        agent = LiveInterviewAgent(api_key=api_key)
+        transcript = await agent.run(
+            websocket=websocket,
             session_id=session_id,
-            session_data={
-                "title": f"{session['interview_type']} — {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-                "status": "completed",
-                "interview_plan": session["question_plan"],
-                "conversation_history": transcript,
-                "total_questions": len(session["question_plan"]),
-                "average_score": report_data.get("overall_score", 0),
-                "final_report": report_data.get("summary", ""),
-                "report_data": report_data,
-                "interview_type": session["interview_type"],
-            },
+            question_plan=session["question_plan"],
+            interview_type=session["interview_type"],
+            resume_file_uri=session["resume_file_uri"],
+            resume_mime_type=session["resume_mime_type"],
+            jd_file_uri=session["jd_file_uri"],
+            jd_mime_type=session["jd_mime_type"],
         )
 
-        await websocket.send_json({"type": "report_ready", "session_id": session_id})
+        if not transcript:
+            logger.warning("Interview ended with empty transcript — skipping analysis.")
+            return
 
-    except Exception as exc:
-        logger.error(f"Post-interview analysis failed: {exc}")
+        # Post-interview: analyze + save
         try:
-            await websocket.send_json({"type": "error", "message": "We couldn't generate your interview report. Please try again."})
-        except Exception:
-            pass
+            svc = GeminiFileService(api_key=api_key, model=settings.GEMINI_MODEL)
+
+            class _FakeFile:
+                def __init__(self, uri, mime):
+                    self.uri = uri
+                    self.mime_type = mime
+
+            report_data = await svc.analyze_transcript(
+                transcript=transcript,
+                resume_file=_FakeFile(session["resume_file_uri"], session["resume_mime_type"]),
+                jd_file=_FakeFile(session["jd_file_uri"], session["jd_mime_type"]),
+            )
+
+            fb = get_firebase_manager()
+            fb.create_interview_session(
+                user_id=uid,
+                session_id=session_id,
+                session_data={
+                    "title": f"{session['interview_type']} — {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+                    "status": "completed",
+                    "interview_plan": session["question_plan"],
+                    "conversation_history": transcript,
+                    "total_questions": len(session["question_plan"]),
+                    "average_score": report_data.get("overall_score", 0),
+                    "final_report": report_data.get("summary", ""),
+                    "report_data": report_data,
+                    "interview_type": session["interview_type"],
+                },
+            )
+
+            await websocket.send_json({"type": "report_ready", "session_id": session_id})
+
+        except Exception as exc:
+            logger.error(f"Post-interview analysis failed: {exc}")
+            try:
+                await websocket.send_json({"type": "error", "message": "We couldn't generate your interview report. Please try again."})
+            except Exception:
+                pass
 
     finally:
+        # Release unconditionally. agent.run() previously sat outside any
+        # try/finally, so a WebSocketDisconnect — the normal way a socket ends —
+        # leaked the _live_sessions entry as well; this wrapper fixes that too.
+        _ws_active_sessions.discard(session_id)
+        remaining = _ws_user_connections.get(uid, 0) - 1
+        if remaining > 0:
+            _ws_user_connections[uid] = remaining
+        else:
+            _ws_user_connections.pop(uid, None)
         _live_sessions.pop(session_id, None)
 
 
