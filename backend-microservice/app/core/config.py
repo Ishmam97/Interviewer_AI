@@ -67,6 +67,10 @@ class Settings(BaseSettings):
     DREAM_JOB_FIT_MODEL: str = os.getenv("DREAM_JOB_FIT_MODEL", "moonshot/kimi-k2-0905-preview")
     SUGGESTION_APPLY_MODEL: str = os.getenv("SUGGESTION_APPLY_MODEL", "openai/gpt-4.1-mini-2025-04-14")
 
+    # Live interview (WebSocket) — concurrency cap per user. /ws/* is outside
+    # slowapi's reach, so this is the only limit on concurrent Gemini streams.
+    MAX_LIVE_WS_PER_USER: int = int(os.getenv("MAX_LIVE_WS_PER_USER", "2"))
+
     # Interview Configuration
     MAX_QUESTIONS: int = int(os.getenv("MAX_QUESTIONS", "5"))
     CHUNK_SIZE: int = int(os.getenv("CHUNK_SIZE", "800"))
