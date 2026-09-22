@@ -41,6 +41,7 @@ def _make_firebase_mock():
     fb.update_interview_session.return_value = True
     fb.get_user_interview_sessions.return_value = []
     fb.get_user_reports.return_value = []
+    fb.get_report_by_session.return_value = None
     fb.get_user_dashboard_stats.return_value = {
         "total_interviews": 0,
         "completed_interviews": 0,

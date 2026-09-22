@@ -1360,14 +1360,17 @@ async def submit_answer(request: Request, payload: AnswerRequest, current_user=D
 
 
 @app.get("/interview/sessions")
-async def get_interview_sessions(current_user=Depends(get_current_user), limit: int = 50):
+async def get_interview_sessions(
+    current_user=Depends(get_current_user), limit: int = 50, cursor: Optional[str] = None
+):
     uid = _get_user_id(current_user)
     fb = get_firebase_manager()
     try:
-        sessions = fb.get_user_interview_sessions(uid, limit) or []
+        sessions = fb.get_user_interview_sessions(uid, limit, start_after=cursor) or []
     except Exception:
         sessions = []
-    return {"sessions": sessions}
+    next_cursor = sessions[-1].get("created_at") if len(sessions) == limit and sessions else None
+    return {"sessions": sessions, "next_cursor": next_cursor}
 
 
 @app.get("/interview/sessions/{session_id}")
@@ -1388,8 +1391,7 @@ async def get_report_by_session(session_id: str, current_user=Depends(get_curren
     """
     uid = _get_user_id(current_user)
     fb = get_firebase_manager()
-    reports = fb.get_user_reports(uid) or []
-    match = next((r for r in reports if r.get("session_id") == session_id), None)
+    match = fb.get_report_by_session(uid, session_id)
     if not match:
         raise HTTPException(status_code=404, detail="Report not found")
     return {
@@ -1400,15 +1402,18 @@ async def get_report_by_session(session_id: str, current_user=Depends(get_curren
 
 
 @app.get("/reports")
-async def get_reports(current_user=Depends(get_current_user), limit: int = 50):
+async def get_reports(
+    current_user=Depends(get_current_user), limit: int = 50, cursor: Optional[str] = None
+):
     """List the current user's saved interview reports."""
     uid = _get_user_id(current_user)
     fb = get_firebase_manager()
     try:
-        reports = fb.get_user_reports(uid, limit) or []
+        reports = fb.get_user_reports(uid, limit, start_after=cursor) or []
     except Exception:
         reports = []
-    return {"reports": reports}
+    next_cursor = reports[-1].get("created_at") if len(reports) == limit and reports else None
+    return {"reports": reports, "next_cursor": next_cursor}
 
 
 @app.get("/dashboard/stats")
@@ -1633,11 +1638,13 @@ async def live_interview_websocket(websocket: WebSocket, session_id: str):
 # ── Resume versioning ─────────────────────────────────────────────────────────
 
 @app.get("/profile/resumes")
-async def get_user_resumes(current_user=Depends(get_current_user)):
+async def get_user_resumes(
+    current_user=Depends(get_current_user), limit: int = 50, cursor: Optional[str] = None
+):
     """Return list of all resume analyses for the current user."""
     uid = _get_user_id(current_user)
     fb = get_firebase_manager()
-    analyses = fb.get_user_resume_analyses(uid) or []
+    analyses = fb.get_user_resume_analyses(uid, limit, start_after=cursor) or []
     profile = fb.get_user_profile(uid) or {}
     active_id = profile.get("current_analysis_id")
 
@@ -1658,7 +1665,8 @@ async def get_user_resumes(current_user=Depends(get_current_user)):
             "has_parsed_sections": has_parsed,
         })
 
-    return {"resumes": results}
+    next_cursor = analyses[-1].get("created_at") if len(analyses) == limit and analyses else None
+    return {"resumes": results, "next_cursor": next_cursor}
 
 
 @app.get("/profile/resumes/{analysis_id}")
@@ -1918,11 +1926,15 @@ async def get_dream_job(dream_job_id: str, current_user=Depends(get_current_user
 
 
 @app.get("/dream-jobs")
-async def list_dream_jobs(current_user=Depends(get_current_user)):
+async def list_dream_jobs(
+    current_user=Depends(get_current_user), limit: int = 50, cursor: Optional[str] = None
+):
     """Return summary list of dream jobs for the authenticated user."""
     uid = _get_user_id(current_user)
     fb = get_firebase_manager()
-    return {"dream_jobs": fb.list_user_dream_jobs(uid)}
+    dream_jobs = fb.list_user_dream_jobs(uid, limit, start_after=cursor) or []
+    next_cursor = dream_jobs[-1].get("created_at") if len(dream_jobs) == limit and dream_jobs else None
+    return {"dream_jobs": dream_jobs, "next_cursor": next_cursor}
 
 
 @app.delete("/dream-job/{dream_job_id}")

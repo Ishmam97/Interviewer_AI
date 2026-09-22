@@ -37,7 +37,7 @@ class TestSessions:
     def test_get_sessions_empty(self, client):
         r = client.get("/interview/sessions")
         assert r.status_code == 200
-        assert r.json() == {"sessions": []}
+        assert r.json() == {"sessions": [], "next_cursor": None}
 
     def test_get_sessions_returns_list(self):
         fb = _make_firebase_mock()
@@ -48,6 +48,41 @@ class TestSessions:
             r = c.get("/interview/sessions")
         assert r.status_code == 200
         assert len(r.json()["sessions"]) == 1
+
+    def test_sessions_page_full_returns_next_cursor(self):
+        """A full page (len == limit) signals there may be more — next_cursor
+        must carry the last doc's created_at so the client can page on."""
+        fb = _make_firebase_mock()
+        fb.get_user_interview_sessions.return_value = [
+            {"id": "s1", "created_at": "2026-01-01T00:00:00"},
+            {"id": "s2", "created_at": "2026-01-02T00:00:00"},
+        ]
+        with authed_client(fb) as c:
+            r = c.get("/interview/sessions?limit=2")
+        assert r.status_code == 200
+        assert r.json()["next_cursor"] == "2026-01-02T00:00:00"
+
+    def test_sessions_page_short_returns_no_next_cursor(self):
+        """Fewer results than the limit means the list is exhausted."""
+        fb = _make_firebase_mock()
+        fb.get_user_interview_sessions.return_value = [
+            {"id": "s1", "created_at": "2026-01-01T00:00:00"},
+        ]
+        with authed_client(fb) as c:
+            r = c.get("/interview/sessions?limit=50")
+        assert r.status_code == 200
+        assert r.json()["next_cursor"] is None
+
+    def test_sessions_cursor_forwarded_to_firebase(self):
+        """The `cursor` query param must reach FirebaseManager as start_after
+        so pagination actually advances instead of always returning page one."""
+        fb = _make_firebase_mock()
+        fb.get_user_interview_sessions.return_value = []
+        with authed_client(fb) as c:
+            c.get("/interview/sessions?cursor=2026-01-01T00:00:00")
+        fb.get_user_interview_sessions.assert_called_once_with(
+            "test-uid-123", 50, start_after="2026-01-01T00:00:00"
+        )
 
     def test_sessions_unauthenticated(self):
         fb = _make_firebase_mock()
@@ -66,7 +101,7 @@ class TestReports:
     def test_get_reports_empty(self, client):
         r = client.get("/reports")
         assert r.status_code == 200
-        assert r.json() == {"reports": []}
+        assert r.json() == {"reports": [], "next_cursor": None}
 
     def test_reports_unauthenticated(self):
         fb = _make_firebase_mock()
@@ -99,23 +134,42 @@ class TestDashboard:
 
 class TestReport:
     def test_report_not_found(self, client, firebase_mock):
-        firebase_mock.get_user_reports.return_value = []
+        firebase_mock.get_report_by_session.return_value = None
         r = client.get("/interview/nonexistent-session/report")
         assert r.status_code == 404
 
     def test_report_from_firestore(self):
         fb = _make_firebase_mock()
-        fb.get_user_reports.return_value = [
-            {
-                "id": "report-1",
-                "session_id": "session-abc",
-                "report_content": "Great performance overall.",
-            }
-        ]
+        fb.get_report_by_session.return_value = {
+            "id": "report-1",
+            "session_id": "session-abc",
+            "report_content": "Great performance overall.",
+        }
         with authed_client(fb) as c:
             r = c.get("/interview/session-abc/report")
         assert r.status_code == 200
         assert r.json()["content"] == "Great performance overall."
+
+    def test_report_lookup_does_not_scan_recent_reports_list(self):
+        """Regression for #32a: the route must not linearly scan
+        get_user_reports (only the 50 most-recent reports) to find a match —
+        that 404s for any interview older than a user's 50 latest reports.
+        It must instead query directly by (user_id, session_id)."""
+        fb = _make_firebase_mock()
+        # Simulate the old bug scenario: the target report is NOT among the
+        # 50 most-recent (get_user_reports returns none matching), but a
+        # direct query for it succeeds.
+        fb.get_user_reports.return_value = []
+        fb.get_report_by_session.return_value = {
+            "id": "report-old",
+            "session_id": "old-session",
+            "report_content": "An old but valid report.",
+        }
+        with authed_client(fb) as c:
+            r = c.get("/interview/old-session/report")
+        assert r.status_code == 200
+        assert r.json()["content"] == "An old but valid report."
+        fb.get_report_by_session.assert_called_once_with("test-uid-123", "old-session")
 
 
 # ── /interview/start ──────────────────────────────────────────────────────────

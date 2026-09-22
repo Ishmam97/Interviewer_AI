@@ -487,9 +487,13 @@ class FirebaseManager:
             return None
 
     def get_user_interview_sessions(
-        self, user_id: str, limit: int = 50
+        self, user_id: str, limit: int = 50, start_after: Optional[str] = None
     ) -> List[Dict[str, Any]]:
-        """Get all interview sessions for a user."""
+        """Get all interview sessions for a user.
+
+        `start_after` is a cursor: the `created_at` value of the last doc from
+        the previous page. Omit it to get the first page (default behavior).
+        """
         logger.info(
             f"Fetching interview sessions for user: {user_id}, limit: {limit}"
         )
@@ -499,9 +503,10 @@ class FirebaseManager:
                 self.db.collection("interview_sessions")
                 .where(filter=FieldFilter("user_id", "==", user_id))
                 .order_by("created_at", direction=firestore.Query.DESCENDING)
-                .limit(limit)
             )
-            docs = query.stream()
+            if start_after:
+                query = query.start_after({"created_at": start_after})
+            docs = query.limit(limit).stream()
 
             sessions = []
             for doc in docs:
@@ -573,28 +578,18 @@ class FirebaseManager:
                 "updated_at": datetime.now().isoformat(),
             }
 
-            # Check if a report already exists for this user+session
+            # Use session_id as the document ID so a re-save overwrites the
+            # existing report instead of creating a duplicate (this also
+            # removes the query-then-write race the old lookup-then-update
+            # approach had).
             if session_id:
-                existing_query = (
-                    self.db.collection("interview_reports")
-                    .where(filter=FieldFilter("user_id", "==", user_id))
-                    .where(
-                        filter=FieldFilter("session_id", "==", session_id)
-                    )
-                    .limit(1)
-                )
-                existing_docs = list(existing_query.stream())
+                self.db.collection("interview_reports").document(
+                    session_id
+                ).set(safe_report)
+                logger.info(f"Report saved with ID: {session_id}")
+                return session_id
 
-                if existing_docs:
-                    # Update existing
-                    report_id = existing_docs[0].id
-                    self.db.collection("interview_reports").document(
-                        report_id
-                    ).update(safe_report)
-                    logger.info(f"Report updated with ID: {report_id}")
-                    return report_id
-
-            # Insert new report
+            # No session_id to key off of — fall back to an auto-generated ID.
             _, doc_ref = self.db.collection("interview_reports").add(
                 safe_report
             )
@@ -607,9 +602,13 @@ class FirebaseManager:
             return None
 
     def get_user_reports(
-        self, user_id: str, limit: int = 50
+        self, user_id: str, limit: int = 50, start_after: Optional[str] = None
     ) -> List[Dict[str, Any]]:
-        """Get all reports for a user."""
+        """Get all reports for a user.
+
+        `start_after` is a cursor: the `created_at` value of the last doc from
+        the previous page. Omit it to get the first page (default behavior).
+        """
         logger.info(f"Fetching reports for user: {user_id}, limit: {limit}")
 
         try:
@@ -617,9 +616,10 @@ class FirebaseManager:
                 self.db.collection("interview_reports")
                 .where(filter=FieldFilter("user_id", "==", user_id))
                 .order_by("created_at", direction=firestore.Query.DESCENDING)
-                .limit(limit)
             )
-            docs = query.stream()
+            if start_after:
+                query = query.start_after({"created_at": start_after})
+            docs = query.limit(limit).stream()
 
             reports = []
             for doc in docs:
@@ -641,6 +641,33 @@ class FirebaseManager:
             logger.error(f"Error fetching user reports: {e}")
             logger.error(f"Full traceback: {traceback.format_exc()}")
             return []
+
+    def get_report_by_session(
+        self, user_id: str, session_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch a single report by (user_id, session_id) via a direct query.
+
+        Unlike scanning `get_user_reports` (which only returns the 50 most
+        recent reports), this finds the report regardless of how many newer
+        reports the user has saved since.
+        """
+        try:
+            query = (
+                self.db.collection("interview_reports")
+                .where(filter=FieldFilter("user_id", "==", user_id))
+                .where(filter=FieldFilter("session_id", "==", session_id))
+                .limit(1)
+            )
+            docs = list(query.stream())
+            if not docs:
+                return None
+            doc = docs[0]
+            data = doc.to_dict()
+            data["id"] = doc.id
+            return data
+        except Exception as e:
+            logger.error(f"Error fetching report by session {session_id}: {e}")
+            return None
 
     def get_report(self, report_id: str) -> Optional[Dict[str, Any]]:
         """Get report by ID."""
@@ -1134,16 +1161,23 @@ class FirebaseManager:
         except Exception:
             return False
 
-    def get_user_resume_analyses(self, user_id: str, limit: int = 50) -> List[Dict[str, Any]]:
-        """Get all resume analyses for a user, ordered by creation date descending."""
+    def get_user_resume_analyses(
+        self, user_id: str, limit: int = 50, start_after: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Get all resume analyses for a user, ordered by creation date descending.
+
+        `start_after` is a cursor: the `created_at` value of the last doc from
+        the previous page. Omit it to get the first page (default behavior).
+        """
         try:
-            docs = (
+            query = (
                 self.db.collection("resume_analyses")
                 .where(filter=FieldFilter("user_id", "==", user_id))
                 .order_by("created_at", direction=firestore.Query.DESCENDING)
-                .limit(limit)
-                .stream()
             )
+            if start_after:
+                query = query.start_after({"created_at": start_after})
+            docs = query.limit(limit).stream()
             results = []
             for doc in docs:
                 data = doc.to_dict()
@@ -1268,16 +1302,23 @@ class FirebaseManager:
             logger.error(f"Error fetching dream job {dream_job_id}: {e}")
             return None
 
-    def list_user_dream_jobs(self, uid: str, limit: int = 50) -> list:
-        """Return summary records for all dream jobs owned by uid."""
+    def list_user_dream_jobs(
+        self, uid: str, limit: int = 50, start_after: Optional[str] = None
+    ) -> list:
+        """Return summary records for all dream jobs owned by uid.
+
+        `start_after` is a cursor: the `created_at` value of the last doc from
+        the previous page. Omit it to get the first page (default behavior).
+        """
         try:
-            docs = (
+            query = (
                 self.db.collection("dream_jobs")
                 .where(filter=FieldFilter("uid", "==", uid))
                 .order_by("created_at", direction=firestore.Query.DESCENDING)
-                .limit(limit)
-                .stream()
             )
+            if start_after:
+                query = query.start_after({"created_at": start_after})
+            docs = query.limit(limit).stream()
             results = []
             for doc in docs:
                 data = doc.to_dict()

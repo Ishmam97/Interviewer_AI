@@ -10,7 +10,13 @@ needs its own bound.
 import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
-from app.services.live_interview_agent import LiveInterviewAgent
+from google.genai import types
+
+from app.services.live_interview_agent import (
+    LiveInterviewAgent,
+    _MAX_HISTORY_TURNS,
+    _trim_history,
+)
 
 
 class _FakeChunk:
@@ -58,3 +64,63 @@ class TestStreamTurnTimeout:
         assert text, "must fall back to a graceful message rather than raise or return empty"
         done_call = ws.send_json.call_args_list[-1]
         assert done_call.args[0]["done"] is True
+
+
+def _make_content(i):
+    return types.Content(role="user", parts=[types.Part(text=f"turn {i}")])
+
+
+class TestTrimHistory:
+    """Regression for #31: resending the whole `contents` list every turn
+    makes per-request token cost grow quadratically with interview length.
+    `_trim_history` must cap what's actually sent while preserving the first
+    entry (it carries the resume/JD file parts) and the tail of recent turns.
+    """
+
+    def test_short_history_is_returned_unchanged(self):
+        contents = [_make_content(i) for i in range(_MAX_HISTORY_TURNS)]
+
+        assert _trim_history(contents) == contents
+
+    def test_long_history_keeps_first_entry_and_recent_tail(self):
+        first = _make_content("opening-with-files")
+        contents = [first] + [_make_content(i) for i in range(30)]
+
+        trimmed = _trim_history(contents)
+
+        assert trimmed[0] is first
+        assert len(trimmed) == _MAX_HISTORY_TURNS + 1
+        assert trimmed[1:] == contents[-_MAX_HISTORY_TURNS:]
+
+    def test_does_not_mutate_original_contents(self):
+        contents = [_make_content(i) for i in range(30)]
+        original_len = len(contents)
+
+        _trim_history(contents)
+
+        assert len(contents) == original_len
+
+
+class TestStreamTurnSendsTrimmedHistory:
+    async def test_generate_content_stream_receives_trimmed_contents(self):
+        """The actual API call must use the trimmed history, not the raw
+        (unboundedly growing) `contents` list — otherwise the cap is
+        computed but never applied."""
+        agent = LiveInterviewAgent(api_key="test-key")
+        agent.client = MagicMock()
+        agent.client.aio.models.generate_content_stream = AsyncMock(
+            return_value=_fake_stream(["ok"])
+        )
+        ws = AsyncMock()
+        first = _make_content("opening-with-files")
+        long_contents = [first] + [_make_content(i) for i in range(30)]
+
+        await agent._stream_turn("system", long_contents, ws)
+
+        call_kwargs = agent.client.aio.models.generate_content_stream.call_args.kwargs
+        sent_contents = call_kwargs["contents"]
+        assert len(sent_contents) == _MAX_HISTORY_TURNS + 1
+        assert sent_contents[0] is first
+        # The full history the caller holds must be untouched — run() keeps
+        # appending to it across the whole interview for the turn protocol.
+        assert len(long_contents) == 31
