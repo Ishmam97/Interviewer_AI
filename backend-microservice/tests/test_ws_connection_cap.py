@@ -230,3 +230,44 @@ class TestOwnershipStillEnforced:
         # A rejected connection must not consume a slot.
         assert SESSION_A not in ws_env._ws_active_sessions
         assert ws_env._ws_user_connections.get(UID, 0) == 0
+
+
+class TestAuthErrorHygiene:
+    """A failed WS auth must not echo the exception back over the socket."""
+
+    def test_auth_failure_message_is_generic(self, ws_env):
+        leaky = "Firebase token verify blew up: project interviewer-ea164 key AIzaLEAK"
+
+        fb = MagicMock()
+        fb.verify_id_token.side_effect = RuntimeError(leaky)
+
+        with patch("app.server.get_firebase_manager", return_value=fb), patch(
+            "app.services.live_interview_agent.LiveInterviewAgent",
+            _agent_returning_immediately(),
+        ):
+            client = _client()
+            with client.websocket_connect(f"/ws/interview/{SESSION_A}") as ws:
+                ws.send_json({"token": "whatever"})
+                msg = ws.receive_json()
+
+        assert msg["type"] == "error"
+        assert msg["message"] == "Authentication failed. Please sign in again."
+        assert leaky not in msg["message"]
+        assert "AIzaLEAK" not in msg["message"]
+        assert "RuntimeError" not in msg["message"]
+
+    def test_failed_auth_consumes_no_slot(self, ws_env):
+        fb = MagicMock()
+        fb.verify_id_token.side_effect = RuntimeError("nope")
+
+        with patch("app.server.get_firebase_manager", return_value=fb), patch(
+            "app.services.live_interview_agent.LiveInterviewAgent",
+            _agent_returning_immediately(),
+        ):
+            client = _client()
+            with client.websocket_connect(f"/ws/interview/{SESSION_A}") as ws:
+                ws.send_json({"token": "whatever"})
+                ws.receive_json()
+
+        assert SESSION_A not in ws_env._ws_active_sessions
+        assert ws_env._ws_user_connections == {}

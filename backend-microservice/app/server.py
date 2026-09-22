@@ -677,8 +677,10 @@ async def upload_resume(
     except HTTPException:
         raise
     except Exception as e:
+        # The full traceback goes to the logs; `e` here can contain provider
+        # error text or resume content, so it must not reach the client.
         import traceback; logger.error(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"Failed to process resume: {e}")
+        raise HTTPException(status_code=500, detail="Failed to process resume. Please try again.")
     finally:
         if resume_path:
             try: os.unlink(resume_path)
@@ -1606,7 +1608,14 @@ async def live_interview_websocket(websocket: WebSocket, session_id: str):
             return
         uid = decoded.get("uid") or decoded.get("user_id")
     except Exception as exc:
-        await websocket.send_json({"type": "error", "message": f"Auth failed: {exc}"})
+        # The exception can carry Firebase/token internals — log it, send the
+        # client a message it can act on. Also covers the receive_json timeout,
+        # where the client simply never sent its auth frame.
+        logger.warning("Live-interview WS auth failed: %s", exc)
+        await websocket.send_json({
+            "type": "error",
+            "message": "Authentication failed. Please sign in again.",
+        })
         await websocket.close()
         return
 
