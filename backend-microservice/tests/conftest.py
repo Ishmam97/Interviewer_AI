@@ -12,6 +12,8 @@ import pytest
 from unittest.mock import MagicMock, patch
 from fastapi.testclient import TestClient
 
+from app.services.usage_service import usage_defaults
+
 # ── Minimal env so pydantic-settings doesn't blow up ──────────────────────────
 os.environ.setdefault("OPENAI_API_KEY", "test-key")
 os.environ.setdefault("GEMINI_API_KEY", "test-key")
@@ -74,6 +76,21 @@ def _make_firebase_mock():
         "session": {"access_token": "id-token-abc"},
     }
     fb.exchange_custom_token.return_value = "id-token-abc"
+
+    # Usage metering (#26): a fresh free-plan user with an open window, so
+    # quota-gated routes behave normally unless a test says otherwise.
+    fb.get_user_settings.return_value = {
+        "user_id": "test-uid-123",
+        "max_questions": 5,
+        "model_name": "gpt-4.1-nano-2025-04-14",
+        "temperature": 0.3,
+        "api_provider": "openai",
+        "user_api_key": "",
+        "base_url": "",
+        **usage_defaults(),
+    }
+    fb.increment_usage.return_value = True
+    fb.reset_usage_window.return_value = True
     return fb
 
 
