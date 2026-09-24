@@ -72,6 +72,14 @@ class Settings(BaseSettings):
     DREAM_JOB_FIT_MODEL: str = os.getenv("DREAM_JOB_FIT_MODEL", "moonshot/kimi-k2-0905-preview")
     SUGGESTION_APPLY_MODEL: str = os.getenv("SUGGESTION_APPLY_MODEL", "openai/gpt-4.1-mini-2025-04-14")
 
+    # Usage quotas (Phase C). Per calendar month, per user, -1 = unlimited.
+    # BYOK users are exempt entirely — they pay the provider directly, so
+    # metering them would charge twice for the same call.
+    FREE_INTERVIEWS_PER_MONTH: int = int(os.getenv("FREE_INTERVIEWS_PER_MONTH", "5"))
+    FREE_RESUME_ANALYSES_PER_MONTH: int = int(os.getenv("FREE_RESUME_ANALYSES_PER_MONTH", "5"))
+    FREE_DREAM_JOBS_PER_MONTH: int = int(os.getenv("FREE_DREAM_JOBS_PER_MONTH", "5"))
+    FREE_SUGGESTION_APPLIES_PER_MONTH: int = int(os.getenv("FREE_SUGGESTION_APPLIES_PER_MONTH", "50"))
+
     # Interview Configuration
     MAX_QUESTIONS: int = int(os.getenv("MAX_QUESTIONS", "5"))
     CHUNK_SIZE: int = int(os.getenv("CHUNK_SIZE", "800"))
