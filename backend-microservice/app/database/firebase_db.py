@@ -26,6 +26,19 @@ class FirebaseManager:
     """Handles all Firebase database and auth operations"""
 
     def __init__(self):
+        # Hard stop: under the test harness a real connection must never be
+        # opened. Any test that builds its own ASGI client without patching
+        # get_firebase_manager would otherwise reach the live project through
+        # the local service-account file — reads went unnoticed for a long
+        # time, and the moment a route started writing, test data landed in
+        # production Firestore. Failing loudly here is the only way this stays
+        # impossible rather than merely unlikely.
+        if os.getenv("ENVIRONMENT", "").lower() == "test":
+            raise RuntimeError(
+                "Refusing to open a real Firebase connection while "
+                "ENVIRONMENT=test. Patch app.server.get_firebase_manager in "
+                "your test (conftest provides an autouse fixture that does)."
+            )
         self._initialize_firebase()
         self.db = firestore.client()
 

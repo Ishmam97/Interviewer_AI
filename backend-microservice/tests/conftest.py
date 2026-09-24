@@ -94,6 +94,25 @@ def _make_firebase_mock():
     return fb
 
 
+@pytest.fixture(autouse=True)
+def _never_touch_real_firebase():
+    """Safety net for every test in the suite.
+
+    Tests that build their own ASGI client (rather than using the `client`
+    fixture) used to fall through to the real FirebaseManager, which picks up
+    the local service-account file and talks to the live project. That was
+    invisible while routes only read; once a route started writing, test runs
+    began creating documents in production Firestore.
+
+    FirebaseManager.__init__ now refuses to connect when ENVIRONMENT=test, and
+    this fixture supplies the mock so those tests still exercise their routes.
+    Fixtures that patch the same attribute (client/unauthed_client) simply
+    nest inside this one.
+    """
+    with patch("app.server.get_firebase_manager", return_value=_make_firebase_mock()):
+        yield
+
+
 @pytest.fixture()
 def firebase_mock():
     return _make_firebase_mock()
