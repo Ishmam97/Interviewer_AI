@@ -15,6 +15,8 @@ import firebase_admin
 from firebase_admin import auth, credentials, firestore
 from google.cloud.firestore_v1 import FieldFilter
 
+from app.services.usage_service import ALL_ACTIONS, counter_field, usage_defaults
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -24,6 +26,19 @@ class FirebaseManager:
     """Handles all Firebase database and auth operations"""
 
     def __init__(self):
+        # Hard stop: under the test harness a real connection must never be
+        # opened. Any test that builds its own ASGI client without patching
+        # get_firebase_manager would otherwise reach the live project through
+        # the local service-account file — reads went unnoticed for a long
+        # time, and the moment a route started writing, test data landed in
+        # production Firestore. Failing loudly here is the only way this stays
+        # impossible rather than merely unlikely.
+        if os.getenv("ENVIRONMENT", "").lower() == "test":
+            raise RuntimeError(
+                "Refusing to open a real Firebase connection while "
+                "ENVIRONMENT=test. Patch app.server.get_firebase_manager in "
+                "your test (conftest provides an autouse fixture that does)."
+            )
         self._initialize_firebase()
         self.db = firestore.client()
 
@@ -108,6 +123,7 @@ class FirebaseManager:
                     "base_url": "",
                     "created_at": datetime.now().isoformat(),
                     "updated_at": datetime.now().isoformat(),
+                    **usage_defaults(),
                 }
             )
 
@@ -277,6 +293,7 @@ class FirebaseManager:
                     "base_url": "",
                     "created_at": datetime.now().isoformat(),
                     "updated_at": datetime.now().isoformat(),
+                    **usage_defaults(),
                 }
                 self.db.collection("user_settings").document(user_id).set(
                     default_settings
@@ -312,6 +329,39 @@ class FirebaseManager:
             return True
         except Exception as e:
             logger.error(f"Error updating user settings: {e}")
+            return False
+
+    def increment_usage(self, user_id: str, action: str) -> bool:
+        """Atomically bump one usage counter.
+
+        firestore.Increment is a server-side operation, so two concurrent
+        requests cannot lose an update the way read-modify-write would. The
+        check itself is still read-then-write, so a burst can overshoot the
+        limit slightly; that is an accepted trade for not putting a transaction
+        on the hot path of a pre-launch, single-instance deployment.
+        """
+        try:
+            self.db.collection("user_settings").document(user_id).update(
+                {
+                    counter_field(action): firestore.Increment(1),
+                    "updated_at": datetime.now().isoformat(),
+                }
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Error incrementing usage counter {action} for {user_id}: {e}")
+            return False
+
+    def reset_usage_window(self, user_id: str, reset_at: str) -> bool:
+        """Zero every counter and open a new window ending at `reset_at`."""
+        try:
+            payload = {counter_field(a): 0 for a in ALL_ACTIONS}
+            payload["usage_reset_at"] = reset_at
+            payload["updated_at"] = datetime.now().isoformat()
+            self.db.collection("user_settings").document(user_id).update(payload)
+            return True
+        except Exception as e:
+            logger.error(f"Error resetting usage window for {user_id}: {e}")
             return False
 
     # ──────────────────────────────────────────────
@@ -813,6 +863,7 @@ class FirebaseManager:
                     "base_url": "",
                     "created_at": datetime.now().isoformat(),
                     "updated_at": datetime.now().isoformat(),
+                    **usage_defaults(),
                 })
                 return {"data": {**profile_data, "id": uid}, "is_new": True}
             else:

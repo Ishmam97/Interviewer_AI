@@ -28,6 +28,7 @@ from slowapi.util import get_remote_address
 
 from app.core.config import settings
 from app.database.firebase_db import FirebaseManager
+from app.services import usage_service
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -579,6 +580,42 @@ async def _run_resume_analysis_bg(uid: str, resume_text: str, filename: str, ana
         await svc.aclose()
 
 
+def _enforce_quota(uid: str, action: str, user_settings: Optional[Dict[str, Any]] = None) -> None:
+    """Check the user's monthly allowance for `action`, then consume one unit.
+
+    Call this AFTER ownership/validation checks (so a request that was going to
+    400 anyway doesn't burn quota) and BEFORE any LLM work — including before
+    `background_tasks.add_task`, or concurrent uploads race the increment and
+    every one of them sees the pre-increment count.
+
+    Raises 402 (not 429) when exhausted: 429 already means slowapi rate
+    limiting, and the client needs to tell "slow down" apart from "you've hit
+    your plan limit" to know whether to show a paywall.
+
+    A Firestore failure here fails OPEN — metering must not take the product
+    down. The hard backstop against runaway spend is the GCP budget alert.
+    """
+    fb = get_firebase_manager()
+    if user_settings is None:
+        user_settings = fb.get_user_settings(uid) or {}
+
+    state = usage_service.evaluate(user_settings, action, settings)
+
+    if state.window_rolled:
+        fb.reset_usage_window(uid, state.reset_at)
+
+    if not state.allowed:
+        logger.info(
+            "Quota exceeded: uid=%s action=%s used=%s limit=%s plan=%s",
+            uid, action, state.used, state.limit, state.plan,
+        )
+        raise HTTPException(status_code=402, detail=state.as_detail())
+
+    # BYOK users are deliberately not metered — they pay the provider directly.
+    if not state.exempt:
+        fb.increment_usage(uid, action)
+
+
 @app.post("/profile/resume")
 @limiter.limit("10/minute")
 async def upload_resume(
@@ -611,6 +648,8 @@ async def upload_resume(
             # every later update_resume_analysis() call would silently no-op and
             # the client would poll a 404 forever.
             raise HTTPException(status_code=500, detail="Failed to start resume analysis")
+
+        _enforce_quota(uid, usage_service.RESUME_ANALYSES)
 
         background_tasks.add_task(_run_resume_analysis_bg, uid, resume_text, resume.filename, analysis_id)
 
@@ -684,6 +723,10 @@ async def update_suggestion(
     analysis = fb.get_resume_analysis_by_id(analysis_id)
     if not analysis or analysis.get("status") != "completed":
         raise HTTPException(status_code=404, detail="Completed resume analysis not found.")
+
+    # Only "accept" reaches an LLM; rejecting a suggestion is free.
+    if request.action == "accept":
+        _enforce_quota(uid, usage_service.SUGGESTION_APPLIES)
 
     new_status = "accepted" if request.action == "accept" else "rejected"
     updated = False
@@ -1080,6 +1123,8 @@ async def apply_bulk_suggestions(
     if analysis.get("status") != "completed":
         raise HTTPException(status_code=400, detail="Analysis is not yet completed")
 
+    _enforce_quota(uid, usage_service.SUGGESTION_APPLIES)
+
     # Mark each suggestion as accepted in the analysis doc
     suggestion_items = []  # [{"id": ..., "text": ...}]
     ids_to_accept = set(request.suggestion_ids)
@@ -1252,6 +1297,8 @@ async def start_interview(
 
     if not resolved_key:
         raise HTTPException(status_code=500, detail="No API key configured. Add your key in Settings.")
+
+    _enforce_quota(user_id, usage_service.INTERVIEWS, user_settings)
 
     effective_model = model_name or user_settings.get("model_name", settings.DEFAULT_MODEL)
 
@@ -1490,6 +1537,13 @@ async def prepare_live_interview(
 
     resume_bytes = await _validate_upload(resume, "resume")
     jd_bytes = await _validate_upload(job_description, "job_description")
+
+    # The live interview counts against the same INTERVIEWS allowance as the
+    # classic flow: both are "a mock interview" to the user, and gating only
+    # /interview/start would leave live mode — the pricier of the two — free.
+    # Charged here rather than at the websocket because this is where the
+    # Gemini file uploads and question-plan generation happen.
+    _enforce_quota(uid, usage_service.INTERVIEWS)
 
     with tempfile.TemporaryDirectory() as tmp:
         resume_path = os.path.join(tmp, resume.filename or "resume.pdf")
@@ -1867,6 +1921,8 @@ async def create_dream_job(
             status_code=400,
             detail="Resume analysis is not yet completed. Wait for it to finish first.",
         )
+
+    _enforce_quota(uid, usage_service.DREAM_JOBS)
 
     dream_job_id = str(uuid.uuid4())
     if not fb.create_dream_job(
