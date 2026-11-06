@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import tempfile
 import time
 import uuid
@@ -21,7 +22,7 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from openai import AsyncOpenAI
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, StrictBool, field_validator
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
@@ -197,6 +198,35 @@ def _get_user_id(user) -> str:
 
 # ── Pydantic models ───────────────────────────────────────────────────────────
 
+class BetaSignupRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
+    consent: StrictBool
+    website: str = Field(default="", max_length=2048)
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def normalize_email(cls, value):
+        if not isinstance(value, str):
+            raise ValueError("Invalid email")
+        value = value.strip().lower()
+        if len(value) > 254 or not re.fullmatch(
+            r"[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+",
+            value,
+        ):
+            raise ValueError("Invalid email")
+        local = value.split("@", 1)[0]
+        if len(local) > 64 or local.startswith(".") or local.endswith(".") or ".." in local:
+            raise ValueError("Invalid email")
+        return value
+
+    @field_validator("consent")
+    @classmethod
+    def require_consent(cls, value):
+        if value is not True:
+            raise ValueError("Consent is required")
+        return value
+
+
 class UserCredentials(BaseModel):
     email: str
     password: str
@@ -358,6 +388,24 @@ async def _run_resume_analysis(resume_text: str) -> dict:
 
 
 # ── Health ────────────────────────────────────────────────────────────────────
+
+@app.post("/beta-signups", status_code=200)
+@limiter.limit("5/minute", key_func=get_remote_address)
+async def create_beta_signup(request: Request, payload: BetaSignupRequest):
+    """Record an opt-in without revealing whether an address is already present."""
+    if payload.website:
+        return {"message": "Thanks for your interest."}
+    try:
+        def save_signup():
+            get_firebase_manager().create_beta_signup(payload.email)
+
+        await asyncio.to_thread(save_signup)
+    except Exception:
+        # Provider exception messages may contain submitted data; do not log them.
+        logger.error("Beta signup storage failed")
+        raise HTTPException(status_code=503, detail="Signup temporarily unavailable")
+    return {"message": "Thanks for your interest."}
+
 
 @app.get("/health")
 async def health_check():

@@ -4,6 +4,7 @@ Replaces the previous SupabaseManager with equivalent functionality.
 """
 
 import os
+import hashlib
 import json
 import copy
 import logging
@@ -14,6 +15,7 @@ from datetime import datetime, timedelta
 import firebase_admin
 from firebase_admin import auth, credentials, firestore
 from google.cloud.firestore_v1 import FieldFilter
+from google.api_core.exceptions import AlreadyExists
 
 from app.services.usage_service import ALL_ACTIONS, counter_field, usage_defaults
 
@@ -83,6 +85,18 @@ class FirebaseManager:
             }
         else:
             return {"success": False, "error": f"Database error: {error_msg}"}
+
+    def create_beta_signup(self, email: str) -> None:
+        """Create once using a deterministic ID; duplicate signups are successful."""
+        document_id = hashlib.sha256(email.encode("utf-8")).hexdigest()
+        try:
+            self.db.collection("beta_signups").document(document_id).create({
+                "email": email,
+                "consent": True,
+                "created_at": firestore.SERVER_TIMESTAMP,
+            })
+        except AlreadyExists:
+            pass
 
     # ──────────────────────────────────────────────
     # Authentication

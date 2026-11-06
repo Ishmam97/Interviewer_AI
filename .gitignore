@@ -188,3 +188,8 @@ service-account*.json
 
 # Frontend is now a standalone peer repo (Ishmam97/reflect-interview-prep), cloned alongside — not tracked here.
 frontend/
+
+# Preserve the requested launch deliverables and continuation script.
+!docs/audits/
+!docs/launch-2026/
+!scripts/continue-at-0550.sh
