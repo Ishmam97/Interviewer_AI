@@ -22,9 +22,10 @@ service cloud.firestore {
 
     // Beta waitlist — written straight from the public landing site (no
     // backend). Create-only with validated fields; nobody can list, read,
-    // update or delete through the client SDK. Doc ID is sha256(email), so a
-    // repeat signup is an update and is rejected (the client treats that as
-    // "already on the list").
+    // update or delete through the client SDK. Doc ID must equal
+    // sha256(email): binds the ID to its email, so nobody can squat another
+    // address's slot or store one email under many IDs. A repeat signup is an
+    // update and is rejected (the client treats that as "already on the list").
     match /beta_signups/{id} {
       allow create: if request.resource.data.keys().hasOnly(['email', 'consent', 'created_at'])
         && request.resource.data.keys().hasAll(['email', 'consent', 'created_at'])
@@ -33,7 +34,7 @@ service cloud.firestore {
         && request.resource.data.email.matches('^[a-z0-9.!#$%&\'*+/=?^_`{|}~-]+@[a-z0-9-]+(\\.[a-z0-9-]+)+$')
         && request.resource.data.consent == true
         && request.resource.data.created_at == request.time
-        && id.matches('^[0-9a-f]{64}$');
+        && id == hashing.sha256(request.resource.data.email).toHexString().lower();
     }
 
     // Interview sessions — owner only
