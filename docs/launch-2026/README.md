@@ -4,6 +4,8 @@ This folder is the working map for the current launch-readiness effort. It conne
 
 ## Documents
 
+- [Dashboard modernization](dashboard-modernization.md) — rollback checkpoints, Docker workflow, retained features and verification.
+
 - [Master product and launch plan](master-plan.md) — consolidated phased backlog, ownership, acceptance gates, pricing experiments, and B2B roadmap.
 
 - [Implementation guide](implementation-guide.md) — component and API map, data flow, implementation recipes, finding-to-code traceability, and acceptance evidence.

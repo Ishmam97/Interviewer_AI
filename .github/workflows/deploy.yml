@@ -16,34 +16,52 @@ on:
 #   OPENAI_API_KEY
 #   GEMINI_API_KEY
 #   FIREBASE_API_KEY
+#
+# Dry-run mode: until GCP_SERVICE_ACCOUNT_KEY is set, the job only builds the
+# image (proving the Dockerfile still works) and skips push and deploy, so the
+# workflow stays green without a paid GCP project.
 
 jobs:
   deploy-backend:
     name: Deploy backend → Cloud Run
     runs-on: ubuntu-latest
+    env:
+      GCP_ENABLED: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY != '' }}
 
     steps:
       - uses: actions/checkout@v4
 
+      - name: Build backend image
+        run: docker build -t interviewer-backend:${{ github.sha }} backend-microservice/
+
+      - name: Dry run — skip deploy (no GCP credentials configured)
+        if: env.GCP_ENABLED != 'true'
+        run: echo "::notice::GCP_SERVICE_ACCOUNT_KEY is not set; image built, push and Cloud Run deploy skipped."
+
       - name: Authenticate to Google Cloud
+        if: env.GCP_ENABLED == 'true'
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
 
       - name: Set up Cloud SDK
+        if: env.GCP_ENABLED == 'true'
         uses: google-github-actions/setup-gcloud@v2
 
       - name: Configure Docker for Artifact Registry
+        if: env.GCP_ENABLED == 'true'
         run: gcloud auth configure-docker ${{ secrets.GCP_REGION }}-docker.pkg.dev --quiet
 
-      - name: Build and push backend image
+      - name: Push backend image
+        if: env.GCP_ENABLED == 'true'
         env:
           IMAGE: ${{ secrets.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/interviewer/backend:${{ github.sha }}
         run: |
-          docker build -t $IMAGE backend-microservice/
+          docker tag interviewer-backend:${{ github.sha }} $IMAGE
           docker push $IMAGE
 
       - name: Deploy to Cloud Run
+        if: env.GCP_ENABLED == 'true'
         id: deploy
         env:
           IMAGE: ${{ secrets.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/interviewer/backend:${{ github.sha }}
@@ -65,4 +83,5 @@ jobs:
           echo "url=$(cat service_url.txt)" >> "$GITHUB_OUTPUT"
 
       - name: Show deployed URL
+        if: env.GCP_ENABLED == 'true'
         run: echo "Deployed to ${{ steps.deploy.outputs.url }}"
