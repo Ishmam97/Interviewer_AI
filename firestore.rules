@@ -12,9 +12,28 @@ service cloud.firestore {
       allow read, write: if isOwner(uid);
     }
 
-    // User settings — owner only
+    // User settings — owner may read; only the backend (Admin SDK, which
+    // bypasses these rules) writes. Holds plan and *_this_month usage
+    // counters, so client writes would let a user reset their own quota.
     match /user_settings/{uid} {
-      allow read, write: if isOwner(uid);
+      allow read: if isOwner(uid);
+      allow write: if false;
+    }
+
+    // Beta waitlist — written straight from the public landing site (no
+    // backend). Create-only with validated fields; nobody can list, read,
+    // update or delete through the client SDK. Doc ID is sha256(email), so a
+    // repeat signup is an update and is rejected (the client treats that as
+    // "already on the list").
+    match /beta_signups/{id} {
+      allow create: if request.resource.data.keys().hasOnly(['email', 'consent', 'created_at'])
+        && request.resource.data.keys().hasAll(['email', 'consent', 'created_at'])
+        && request.resource.data.email is string
+        && request.resource.data.email.size() <= 254
+        && request.resource.data.email.matches('^[a-z0-9.!#$%&\'*+/=?^_`{|}~-]+@[a-z0-9-]+(\\.[a-z0-9-]+)+$')
+        && request.resource.data.consent == true
+        && request.resource.data.created_at == request.time
+        && id.matches('^[0-9a-f]{64}$');
     }
 
     // Interview sessions — owner only
